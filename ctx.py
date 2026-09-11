@@ -2905,6 +2905,10 @@ async def handle_workouts(message: Message, bot: Bot, state: FSMContext):
     if old_menu:
         await delete_message_safe(bot, message.chat.id, old_menu)
         user_last_menu[user_id] = None
+    # Sweep any leftover temp messages from an interrupted flow (add-workout,
+    # AI plan wizard, skip-reason prompt, calorie entry, etc.) — every other
+    # section entry point (handle_diet, back_to_main_msg, ...) already does this.
+    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
     await show_workout_main_menu(user_id, message.chat.id, bot)
 
 @router.message(WorkoutState.waiting_for_goal)
@@ -2934,7 +2938,7 @@ async def _do_workout_add(user_id: int, chat_id: int, bot: Bot, state: FSMContex
     categories = cursor.fetchall()
     await state.set_state(WorkoutState.choosing_category)
     msg = await bot.send_message(chat_id, "Выбери категорию упражнения:", reply_markup=workout_categories_keyboard(categories, action="add"))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 @router.message(F.text == "🏋️ Добавить выполнение")
 async def workout_add_msg(message: Message, bot: Bot, state: FSMContext):
@@ -2951,7 +2955,7 @@ async def workout_add_msg(message: Message, bot: Bot, state: FSMContext):
             f"{name}, план тренировок не настроен.\n\nСоздать план с ИИ или введёшь свой?",
             reply_markup=wp_mode_keyboard()
         )
-        user_temp_messages[user_id] = {'workout_menu': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
     else:
         await show_ai_workout_today(user_id, message.chat.id, bot, state)
 
@@ -2985,7 +2989,7 @@ async def workout_add_choose_category(callback: CallbackQuery, bot: Bot, state: 
     await state.update_data(category_id=cat_id)
     await state.set_state(WorkoutState.choosing_exercise)
     msg = await callback.message.answer("Выбери упражнение:", reply_markup=workout_exercises_keyboard(exercises, cat_id, action="add"))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(WorkoutState.choosing_exercise, F.data.startswith("w_add_ex_"))
@@ -3046,7 +3050,7 @@ async def workout_add_choose_exercise(callback: CallbackQuery, bot: Bot, state: 
 
     text = f"Упражнение: {ex_name}" + target_info + last_info + "\n\nВыбери действие:"
     msg = await callback.message.answer(text, reply_markup=workout_action_choice_keyboard(ex_id))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data.startswith("w_manual_"))
@@ -3062,7 +3066,7 @@ async def workout_manual_enter(callback: CallbackQuery, bot: Bot, state: FSMCont
     else:
         await state.set_state(WorkoutState.entering_reps)
         msg = await callback.message.answer("Введи повторения.\nПримеры: 10, 10,8,6 или 3x10")
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.message(WorkoutState.entering_reps)
@@ -3100,7 +3104,7 @@ async def workout_enter_reps(message: Message, bot: Bot, state: FSMContext):
         await state.set_state(WorkoutState.entering_distance)
         msg = await message.answer("Введи дистанцию в км (или отправь '-', если не хочешь указывать):")
 
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 async def save_workout_and_continue(message: Message, bot: Bot, state: FSMContext, user_id: int):
     data = await state.get_data()
@@ -3216,7 +3220,7 @@ async def workout_enter_distance(message: Message, bot: Bot, state: FSMContext):
     await state.update_data(distance=distance)
     await state.set_state(WorkoutState.entering_duration)
     msg = await message.answer("Введи время в минутах (или отправь '-', если не хочешь указывать):")
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 @router.message(WorkoutState.entering_duration)
 async def workout_enter_duration(message: Message, bot: Bot, state: FSMContext):
@@ -3246,7 +3250,7 @@ async def workout_continue_yes(callback: CallbackQuery, bot: Bot, state: FSMCont
     categories = cursor.fetchall()
     await state.set_state(WorkoutState.choosing_category)
     msg = await callback.message.answer("Выбери категорию упражнения:", reply_markup=workout_categories_keyboard(categories, action="add"))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data.startswith("w_achieve_goal_"))
@@ -3597,7 +3601,7 @@ async def _generate_and_show_plan(callback, bot: Bot, state: FSMContext):
     except:
         msg = await bot.send_message(callback.message.chat.id, text,
                                       reply_markup=wp_plan_review_keyboard())
-        user_temp_messages[user_id] = {'workout_menu': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
 
     # dummy placeholder to keep indentation
     pass
@@ -3696,7 +3700,7 @@ async def _handle_exercise_replace(message: Message, bot: Bot, state: FSMContext
     msg = await message.answer(confirm, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
     ]))
-    user_temp_messages[user_id] = {'workout_menu': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
 
 @router.message(AIPlanState.editing_plan)
 async def wp_plan_edit_input(message: Message, bot: Bot, state: FSMContext):
@@ -3843,7 +3847,7 @@ async def wp_manual_input(message: Message, bot: Bot, state: FSMContext):
                     [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
                 ])
             )
-            user_temp_messages[user_id] = {'workout_error': err_msg.message_id}
+            user_temp_messages.setdefault(user_id, {})['workout_error'] = err_msg.message_id
         except Exception as e:
             print(f"[MANUAL INPUT] Error sending error message: {e}")
         return
@@ -4364,7 +4368,7 @@ async def _do_workout_manage(user_id: int, chat_id: int, bot: Bot):
     cursor = db.execute('SELECT id, name FROM exercise_categories WHERE user_id = ? ORDER BY name', (user_id,))
     categories = cursor.fetchall()
     msg = await bot.send_message(chat_id, "📋 Мои категории:", reply_markup=workout_categories_keyboard(categories, action="manage"))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 
 @router.message(F.text == "📋 Управление")
@@ -4407,7 +4411,7 @@ async def workout_edit_plan_msg(message: Message, bot: Bot, state: FSMContext):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
         ])
     )
-    user_temp_messages[user_id] = {'workout_menu': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
 
 @router.message(F.text == "🆕 Новый план (ИИ)")
 async def workout_new_ai_plan_msg(message: Message, bot: Bot, state: FSMContext):
@@ -4424,7 +4428,7 @@ async def workout_new_ai_plan_msg(message: Message, bot: Bot, state: FSMContext)
         f"{name}, создаём новый план с нуля.\n\nШаг 1 из 3\nКакая твоя цель?",
         reply_markup=wp_goal_keyboard()
     )
-    user_temp_messages[user_id] = {'workout_menu': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
 
 @router.message(F.text == "📝 Загрузить свой план")
 async def workout_replace_plan_msg(message: Message, bot: Bot, state: FSMContext):
@@ -4460,7 +4464,7 @@ async def workout_replace_plan_msg(message: Message, bot: Bot, state: FSMContext
             [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
         ])
     )
-    user_temp_messages[user_id] = {'workout_menu': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
 
 @router.message(F.text == "🔙 Назад к тренировкам")
 async def back_to_workout_main(message: Message, bot: Bot, state: FSMContext):
@@ -4506,7 +4510,7 @@ async def workout_new_category(callback: CallbackQuery, bot: Bot, state: FSMCont
     msg = await callback.message.answer(
         "Введи название новой категории (например, 'Грудь', 'Кардио'):"
     )
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.message(WorkoutState.creating_category)
@@ -4527,7 +4531,7 @@ async def workout_create_category(message: Message, bot: Bot, state: FSMContext)
             [InlineKeyboardButton(text="🚴 Кардио", callback_data="cat_type_cardio")],
         ])
     )
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 @router.callback_query(F.data.in_({"cat_type_strength", "cat_type_cardio"}))
 async def workout_create_category_type(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -4575,7 +4579,7 @@ async def workout_manage_view_category(callback: CallbackQuery, bot: Bot, state:
     cat_name = row[0]
     await state.update_data(current_cat_id=cat_id)
     msg = await callback.message.answer(f"Категория: {cat_name}", reply_markup=workout_category_actions_keyboard(cat_id))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data.startswith("w_cat_rename_"))
@@ -4585,7 +4589,7 @@ async def workout_rename_category(callback: CallbackQuery, bot: Bot, state: FSMC
     await callback.message.delete()
     await state.set_state(WorkoutState.renaming_category)
     msg = await callback.message.answer("Введи новое название для категории:")
-    user_temp_messages[callback.from_user.id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.message(WorkoutState.renaming_category)
@@ -4625,7 +4629,7 @@ async def workout_delete_category_confirm(callback: CallbackQuery, bot: Bot, sta
              InlineKeyboardButton(text="❌ Нет", callback_data="workout_manage")]
         ])
     )
-    user_temp_messages[callback.from_user.id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data == "w_cat_delete_yes", WorkoutState.deleting_category_confirm)
@@ -4668,7 +4672,7 @@ async def workout_manage_exercises(callback: CallbackQuery, bot: Bot, state: FSM
         f"Упражнения в категории '{cat_name}':",
         reply_markup=workout_exercises_keyboard(exercises, cat_id, action="manage")
     )
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data == "w_back_to_cats_from_ex")
@@ -4682,7 +4686,7 @@ async def workout_back_to_cats_from_ex(callback: CallbackQuery, bot: Bot, state:
         "Выбери категорию упражнения:",
         reply_markup=workout_categories_keyboard(categories, action="add")
     )
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data == "w_back_to_ex_from_actions")
@@ -4704,7 +4708,7 @@ async def workout_manage_view_exercise(callback: CallbackQuery, bot: Bot, state:
     ex_name, cat_id = row
     await state.update_data(current_ex_id=ex_id, current_cat_id=cat_id)
     msg = await callback.message.answer(f"Упражнение: {ex_name}", reply_markup=workout_exercise_actions_keyboard(ex_id))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data.startswith("w_ex_set_goal_"))
@@ -4724,7 +4728,7 @@ async def workout_set_goal_from_manage(callback: CallbackQuery, bot: Bot, state:
         "Выбери тип цели:",
         reply_markup=workout_exercise_goal_keyboard()
     )
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data.regexp(r'^w_ex_new_\d+$'))
@@ -4734,7 +4738,7 @@ async def workout_new_exercise(callback: CallbackQuery, bot: Bot, state: FSMCont
     await callback.message.delete()
     await state.set_state(WorkoutState.creating_exercise)
     msg = await callback.message.answer("Введи название нового упражнения (например, 'Жим лёжа', 'Бег'):")
-    user_temp_messages[callback.from_user.id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.message(WorkoutState.creating_exercise)
@@ -4770,7 +4774,7 @@ async def prompt_set_goal(message: Message, bot: Bot, state: FSMContext, user_id
         "Хочешь установить цель для этого упражнения?\nВыбери тип:",
         reply_markup=workout_exercise_goal_keyboard()
     )
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 @router.callback_query(WorkoutState.setting_goal_type, F.data == "goal_strength")
 async def set_goal_strength(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -4780,7 +4784,7 @@ async def set_goal_strength(callback: CallbackQuery, bot: Bot, state: FSMContext
         "Введи цель для силового упражнения в формате: подходы x повторения (например, 3x10)\n"
         "Если хочешь указать целевой вес и шаг увеличения, добавь ещё два числа через пробел: 3x10 50 2.5"
     )
-    user_temp_messages[callback.from_user.id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.message(WorkoutState.setting_strength_goal)
@@ -4813,7 +4817,7 @@ async def set_strength_goal_finish(message: Message, bot: Bot, state: FSMContext
         target_reps = ','.join(str(r) for r in target_reps_list)
     except ValueError:
         msg = await message.answer("❌ Неверный формат цели. Используй примеры:\n- 3x10\n- 10 8 6\n- 3x10 50 2.5")
-        user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
         return
 
     data = await state.get_data()
@@ -4843,7 +4847,7 @@ async def set_goal_cardio(callback: CallbackQuery, bot: Bot, state: FSMContext):
     msg = await callback.message.answer(
         "Введи цель для кардио в формате: дистанция км / время мин (например, 5 30)"
     )
-    user_temp_messages[callback.from_user.id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.message(WorkoutState.setting_cardio_goal)
@@ -4857,7 +4861,7 @@ async def set_cardio_goal_finish(message: Message, bot: Bot, state: FSMContext):
     parts = text.split()
     if len(parts) != 2:
         msg = await message.answer("❌ Нужно два числа: дистанция (км) и время (мин).")
-        user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
         return
 
     try:
@@ -4865,7 +4869,7 @@ async def set_cardio_goal_finish(message: Message, bot: Bot, state: FSMContext):
         target_duration = int(parts[1])
     except ValueError:
         msg = await message.answer("❌ Неверный формат чисел.")
-        user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
         return
 
     data = await state.get_data()
@@ -4917,7 +4921,7 @@ async def workout_rename_exercise(callback: CallbackQuery, bot: Bot, state: FSMC
     await callback.message.delete()
     await state.set_state(WorkoutState.renaming_exercise)
     msg = await callback.message.answer("Введи новое название для категории:")
-    user_temp_messages[callback.from_user.id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.message(WorkoutState.renaming_exercise)
@@ -4963,7 +4967,7 @@ async def workout_delete_exercise_confirm(callback: CallbackQuery, bot: Bot, sta
              InlineKeyboardButton(text="❌ Нет", callback_data="workout_manage")]
         ])
     )
-    user_temp_messages[callback.from_user.id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(F.data == "w_ex_delete_yes", WorkoutState.deleting_exercise_confirm)
@@ -5105,7 +5109,7 @@ async def workout_edit_exercise_start(message: Message, bot: Bot, state: FSMCont
     temps = user_temp_messages.get(user_id, {})
     await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
     msg = await message.answer("Выбери день тренировки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    user_temp_messages[user_id] = {'workout_menu': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
     await state.set_state(AIPlanState.editing_plan)
     await state.update_data(wp_edit_mode="exercise")
 
@@ -5319,7 +5323,7 @@ async def show_history_page(user_id: int, chat_id: int, bot: Bot, state: FSMCont
         await bot.edit_message_text(text, chat_id, edit_message_id, reply_markup=reply_markup)
     else:
         msg = await bot.send_message(chat_id, text, reply_markup=reply_markup)
-        user_temp_messages[user_id] = {'workout_history': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['workout_history'] = msg.message_id
 
 @router.callback_query(F.data == "history_prev")
 async def history_prev(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -5349,7 +5353,7 @@ async def _do_workout_charts(user_id: int, chat_id: int, bot: Bot, state: FSMCon
     await state.set_state(WorkoutState.choosing_category)
     await state.update_data(workout_charts_mode=True)
     msg = await bot.send_message(chat_id, "Выбери категорию для графика:", reply_markup=workout_categories_keyboard(categories, action="add"))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 @router.message(F.text == "📈 Графики упражнений")
 async def workout_charts_msg(message: Message, bot: Bot, state: FSMContext):
@@ -5381,7 +5385,7 @@ async def workout_charts_choose_category(callback: CallbackQuery, bot: Bot, stat
     await state.update_data(chart_cat_id=cat_id)
     await state.set_state(WorkoutState.choosing_exercise)
     msg = await callback.message.answer("Выбери упражнение для графика:", reply_markup=workout_exercises_keyboard(exercises, cat_id, action="add"))
-    user_temp_messages[user_id] = {'workout_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(WorkoutState.choosing_exercise, F.data.startswith("w_add_ex_"))
@@ -5522,7 +5526,7 @@ async def show_diet_menu(user_id: int, chat_id: int, bot: Bot):
 
 Выбери действие:"""
     msg = await bot.send_message(chat_id, text, reply_markup=diet_menu_reply_keyboard())
-    user_temp_messages[user_id] = {'diet_menu': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['diet_menu'] = msg.message_id
 
 @router.message(F.text == "🍎 Записать еду")
 async def diet_log_food_reply(message: Message, bot: Bot, state: FSMContext):
@@ -5539,7 +5543,7 @@ async def diet_log_food_reply(message: Message, bot: Bot, state: FSMContext):
     await state.clear()
     await state.set_state(DietState.meal_type)
     msg = await message.answer("Выбери приём пищи:", reply_markup=meal_type_keyboard())
-    user_temp_messages[user_id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['diet_temp'] = msg.message_id
 
 @router.message(DietState.meal_type, F.text.in_(["🍳 Завтрак", "🥗 Обед", "🍽 Ужин", "🍪 Перекус"]))
 async def diet_choose_meal(message: Message, bot: Bot, state: FSMContext):
@@ -5562,7 +5566,7 @@ async def diet_choose_meal(message: Message, bot: Bot, state: FSMContext):
         parse_mode="HTML",
         reply_markup=meal_chosen_keyboard()
     )
-    user_temp_messages[message.from_user.id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['diet_temp'] = msg.message_id
 
 @router.message(DietState.meal_type, F.text == "🔙 Отмена")
 async def diet_cancel_meal(message: Message, bot: Bot, state: FSMContext):
@@ -5581,7 +5585,7 @@ async def meal_entry_manual(callback: CallbackQuery, bot: Bot, state: FSMContext
         "✏️ Введи количество калорий (только число):",
         reply_markup=food_cancel_keyboard()
     )
-    user_temp_messages[user_id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['diet_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(DietState.meal_type, F.data == "meal_entry_cancel")
@@ -5633,7 +5637,7 @@ async def diet_create_new_food(callback: CallbackQuery, bot: Bot, state: FSMCont
         "Или нажми /cancel для отмены.",
         reply_markup=food_cancel_keyboard()
     )
-    user_temp_messages[callback.from_user.id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(DietState.food_description, F.data == "food_cancel")
@@ -5721,7 +5725,7 @@ async def process_food_photo(message: Message, bot: Bot, state: FSMContext):
             f"🍽 Определено: {description}\n❌ Не удалось оценить калории. Введи вручную (число):",
             reply_markup=food_cancel_keyboard()
         )
-        user_temp_messages[user_id] = {'diet_temp': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['diet_temp'] = msg.message_id
         return
 
     await state.update_data(food_description=description, food_calories=calories)
@@ -5790,7 +5794,7 @@ async def process_food_description(message: Message, bot: Bot, state: FSMContext
             "❌ Не удалось определить калории автоматически. Введи калории вручную (только число):",
             reply_markup=food_cancel_keyboard()
         )
-        user_temp_messages[user_id] = {'diet_temp': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['diet_temp'] = msg.message_id
         return
 
     await state.update_data(food_description=description, food_calories=calories)
@@ -5827,7 +5831,7 @@ async def food_add_more(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await state.set_state(DietState.meal_type)
     await callback.message.delete()
     msg = await callback.message.answer("Выбери приём пищи:", reply_markup=meal_type_keyboard())
-    user_temp_messages[callback.from_user.id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(DietState.food_confirm, F.data == "food_confirm_redo")
@@ -5836,7 +5840,7 @@ async def food_confirm_redo(callback: CallbackQuery, bot: Bot, state: FSMContext
     chat_id = callback.message.chat.id
     await callback.message.edit_reply_markup(reply_markup=None)
     msg = await bot.send_message(chat_id, "Выбери приём пищи:", reply_markup=meal_type_keyboard())
-    user_temp_messages[callback.from_user.id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
     await callback.message.delete()
     await callback.answer()
 
@@ -5846,7 +5850,7 @@ async def food_confirm_manual(callback: CallbackQuery, bot: Bot, state: FSMConte
     chat_id = callback.message.chat.id
     await callback.message.edit_reply_markup(reply_markup=None)
     msg = await bot.send_message(chat_id, "✏️ Введи количество калорий вручную (только число):", reply_markup=food_cancel_keyboard())
-    user_temp_messages[callback.from_user.id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
     await callback.message.delete()
     await callback.answer()
 
@@ -5876,7 +5880,7 @@ async def manual_calories(message: Message, bot: Bot, state: FSMContext):
         f"✅ Записано: {int(calories)} ккал\n\nСохранить в «Мои блюда»?",
         reply_markup=save_food_keyboard()
     )
-    user_temp_messages[user_id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['diet_temp'] = msg.message_id
 
 @router.callback_query(DietState.new_food_name, F.data == "save_food_skip")
 async def save_food_skip(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -5895,7 +5899,7 @@ async def save_food_skip(callback: CallbackQuery, bot: Bot, state: FSMContext):
 async def save_food_yes_prompt(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.message.delete()
     msg = await callback.message.answer("Введи название блюда для сохранения:")
-    user_temp_messages[callback.from_user.id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
     await state.update_data(awaiting_food_name_input=True)
     await callback.answer()
 
@@ -5941,7 +5945,7 @@ async def diet_log_weight_reply(message: Message, bot: Bot, state: FSMContext):
     await state.clear()
     await state.set_state(DietState.log_weight)
     msg = await message.answer("⚖️ Введи свой текущий вес (в кг):")
-    user_temp_messages[message.from_user.id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['diet_temp'] = msg.message_id
 
 @router.message(DietState.log_weight)
 async def diet_log_weight_finish(message: Message, bot: Bot, state: FSMContext):
@@ -6011,7 +6015,7 @@ async def diet_body_fat_reply(message: Message, bot: Bot, state: FSMContext):
     )
     await state.set_state(DietState.body_fat_measurements)
     msg = await message.answer(instructions)
-    user_temp_messages[message.from_user.id] = {'diet_temp': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['diet_temp'] = msg.message_id
 
 @router.message(DietState.body_fat_measurements)
 async def diet_body_fat_calculate(message: Message, bot: Bot, state: FSMContext):
@@ -6158,7 +6162,7 @@ async def show_food_history_page(user_id: int, chat_id: int, bot: Bot, state: FS
         await bot.edit_message_text(text, chat_id, edit_message_id, reply_markup=reply_markup)
     else:
         msg = await bot.send_message(chat_id, text, reply_markup=reply_markup)
-        user_temp_messages[user_id] = {'food_history': msg.message_id}
+        user_temp_messages.setdefault(user_id, {})['food_history'] = msg.message_id
 
 @router.callback_query(F.data == "food_history_prev")
 async def food_history_prev(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6243,7 +6247,7 @@ async def diet_change_goal_reply(message: Message, bot: Bot, state: FSMContext):
     await state.clear()
     await state.set_state(DietState.weight)
     msg = await message.answer("📝 Введи свой вес (в кг):")
-    user_temp_messages[message.from_user.id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
 
 # ---------- Обработчики шагов настройки диеты ----------
 
@@ -6265,7 +6269,7 @@ async def diet_step_weight(message: Message, bot: Bot, state: FSMContext):
     await state.update_data(weight=weight)
     await state.set_state(DietState.height)
     msg = await message.answer("📝 Введи свой рост (в см):")
-    user_temp_messages[message.from_user.id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
 
 @router.message(DietState.height)
 async def diet_step_height(message: Message, bot: Bot, state: FSMContext):
@@ -6285,7 +6289,7 @@ async def diet_step_height(message: Message, bot: Bot, state: FSMContext):
     await state.update_data(height=height)
     await state.set_state(DietState.age)
     msg = await message.answer("📝 Введи свой возраст (лет):")
-    user_temp_messages[message.from_user.id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
 
 @router.message(DietState.age)
 async def diet_step_age(message: Message, bot: Bot, state: FSMContext):
@@ -6305,7 +6309,7 @@ async def diet_step_age(message: Message, bot: Bot, state: FSMContext):
     await state.update_data(age=age)
     await state.set_state(DietState.gender)
     msg = await message.answer("👤 Укажи пол:", reply_markup=gender_keyboard())
-    user_temp_messages[message.from_user.id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
 
 @router.callback_query(DietState.gender, F.data.in_({"gender_male", "gender_female"}))
 async def diet_step_gender(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6314,7 +6318,7 @@ async def diet_step_gender(callback: CallbackQuery, bot: Bot, state: FSMContext)
     await state.update_data(gender=gender)
     await state.set_state(DietState.activity)
     msg = await callback.message.answer("🏃 Выбери уровень активности:", reply_markup=activity_keyboard())
-    user_temp_messages[callback.from_user.id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_setup'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(DietState.activity, F.data.startswith("activity_"))
@@ -6328,7 +6332,7 @@ async def diet_step_activity(callback: CallbackQuery, bot: Bot, state: FSMContex
     await state.update_data(activity_level=activity_level)
     await state.set_state(DietState.goal)
     msg = await callback.message.answer("🎯 Выбери цель:", reply_markup=goal_keyboard())
-    user_temp_messages[callback.from_user.id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_setup'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(DietState.goal, F.data.in_({"goal_loss", "goal_maintain", "goal_gain"}))
@@ -6345,7 +6349,7 @@ async def diet_step_goal(callback: CallbackQuery, bot: Bot, state: FSMContext):
         await state.set_state(DietState.target_weight)
         direction = "сбросить" if goal_type == "loss" else "набрать"
         msg = await callback.message.answer(f"⚖️ Сколько кг хочешь {direction}? (например, 5):")
-        user_temp_messages[callback.from_user.id] = {'diet_setup': msg.message_id}
+        user_temp_messages.setdefault(callback.from_user.id, {})['diet_setup'] = msg.message_id
     await callback.answer()
 
 @router.message(DietState.target_weight)
@@ -6366,7 +6370,7 @@ async def diet_step_target_weight(message: Message, bot: Bot, state: FSMContext)
     await state.update_data(target_weight_change=change)
     await state.set_state(DietState.target_days)
     msg = await message.answer("📅 За сколько дней хочешь достичь цели? (например, 90):")
-    user_temp_messages[message.from_user.id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
 
 @router.message(DietState.target_days)
 async def diet_step_target_days(message: Message, bot: Bot, state: FSMContext):
@@ -6420,7 +6424,7 @@ async def _show_diet_confirm(message, user_id: int, state: FSMContext):
 
     await state.update_data(daily_calories=daily_calories)
     msg = await message.answer(text, parse_mode="HTML", reply_markup=diet_confirm_keyboard())
-    user_temp_messages[user_id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['diet_setup'] = msg.message_id
 
 @router.callback_query(DietState.confirm, F.data == "diet_confirm")
 async def diet_step_confirm(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6453,7 +6457,7 @@ async def diet_step_restart(callback: CallbackQuery, bot: Bot, state: FSMContext
     await state.clear()
     await state.set_state(DietState.weight)
     msg = await callback.message.answer("📝 Введи свой вес (в кг):")
-    user_temp_messages[user_id] = {'diet_setup': msg.message_id}
+    user_temp_messages.setdefault(user_id, {})['diet_setup'] = msg.message_id
     await callback.answer()
 
 # ============ ЗАДАЧИ ============
@@ -6564,7 +6568,7 @@ async def task_new_start(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.message.delete()
     await state.set_state(TaskState.entering_title)
     msg = await callback.message.answer("📝 Введи название задачи:")
-    user_temp_messages[callback.from_user.id] = {'task_create': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['task_create'] = msg.message_id
     await callback.answer()
 
 @router.message(TaskState.entering_title)
@@ -6582,7 +6586,7 @@ async def task_enter_title(message: Message, bot: Bot, state: FSMContext):
     await state.update_data(task_title=title)
     await state.set_state(TaskState.choosing_repeat)
     msg = await message.answer(f"Задача \u00ab{title}\u00bb\n\nОна разовая или повторяющаяся?", reply_markup=task_repeat_keyboard())
-    user_temp_messages[message.from_user.id] = {'task_create': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['task_create'] = msg.message_id
 
 @router.callback_query(TaskState.choosing_repeat, F.data.in_({"task_type_once", "task_type_repeat"}))
 async def task_choose_type(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6598,7 +6602,7 @@ async def task_choose_type(callback: CallbackQuery, bot: Bot, state: FSMContext)
             "🔁 Выбери дни недели (можно несколько):",
             reply_markup=task_days_keyboard([])
         )
-    user_temp_messages[callback.from_user.id] = {'task_create': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['task_create'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(TaskState.choosing_days, F.data.startswith("task_day_"))
@@ -6626,7 +6630,7 @@ async def task_days_done(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.message.delete()
     await state.set_state(TaskState.choosing_priority)
     msg = await callback.message.answer("🔥 Это важная задача?", reply_markup=task_priority_keyboard())
-    user_temp_messages[callback.from_user.id] = {'task_create': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['task_create'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(TaskState.choosing_priority, F.data.in_({"task_priority_yes", "task_priority_no"}))
@@ -6636,7 +6640,7 @@ async def task_choose_priority(callback: CallbackQuery, bot: Bot, state: FSMCont
     await callback.message.delete()
     await state.set_state(TaskState.choosing_deadline)
     msg = await callback.message.answer("📅 Хочешь добавить дедлайн?", reply_markup=task_deadline_keyboard())
-    user_temp_messages[callback.from_user.id] = {'task_create': msg.message_id}
+    user_temp_messages.setdefault(callback.from_user.id, {})['task_create'] = msg.message_id
     await callback.answer()
 
 @router.callback_query(TaskState.choosing_deadline, F.data.in_({"task_deadline_yes", "task_deadline_no"}))
@@ -6645,7 +6649,7 @@ async def task_choose_deadline(callback: CallbackQuery, bot: Bot, state: FSMCont
     if callback.data == "task_deadline_yes":
         await state.set_state(TaskState.entering_deadline)
         msg = await callback.message.answer("📅 Введи дату дедлайна в формате ДД.ММ.ГГГГ:")
-        user_temp_messages[callback.from_user.id] = {'task_create': msg.message_id}
+        user_temp_messages.setdefault(callback.from_user.id, {})['task_create'] = msg.message_id
     else:
         await state.update_data(deadline=None)
         await _save_task(callback.message, callback.from_user.id, bot, state)
@@ -6710,7 +6714,7 @@ async def handle_stats(message: Message, bot: Bot, state: FSMContext):
         await delete_message_safe(bot, message.chat.id, old_menu)
         user_last_menu[message.from_user.id] = None
     msg = await message.answer("📊 Выбери тип статистики:", reply_markup=stats_keyboard())
-    user_temp_messages[message.from_user.id] = {'stats_choice': msg.message_id}
+    user_temp_messages.setdefault(message.from_user.id, {})['stats_choice'] = msg.message_id
 
 @router.callback_query(F.data.startswith("stats:"))
 async def show_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6725,7 +6729,7 @@ async def show_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
             bar = create_short_progress_bar(int(avg))
             text += f"{cat}: {avg:.1f}/10 {bar}\n"
         msg = await callback.message.answer(text, reply_markup=rank_back_keyboard())
-        user_temp_messages[callback.from_user.id] = {'stats_result': msg.message_id}
+        user_temp_messages.setdefault(callback.from_user.id, {})['stats_result'] = msg.message_id
     elif period == "month":
         ratings = get_ratings(callback.from_user.id, days=30)
         text = f"📊 Статистика за месяц | {name}\n\n"
@@ -6733,13 +6737,13 @@ async def show_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
             bar = create_short_progress_bar(int(avg))
             text += f"{cat}: {avg:.1f}/10 {bar}\n"
         msg = await callback.message.answer(text, reply_markup=rank_back_keyboard())
-        user_temp_messages[callback.from_user.id] = {'stats_result': msg.message_id}
+        user_temp_messages.setdefault(callback.from_user.id, {})['stats_result'] = msg.message_id
     elif period == "chart_week":
         await callback.answer("📈 Генерирую...")
         daily_data = get_daily_ratings(callback.from_user.id, days=7)
         if not daily_data:
             msg = await callback.message.answer("❌ Нет данных для графика", reply_markup=rank_back_keyboard())
-            user_temp_messages[callback.from_user.id] = {'stats_result': msg.message_id}
+            user_temp_messages.setdefault(callback.from_user.id, {})['stats_result'] = msg.message_id
             return
         temp_msg = await callback.message.answer("📈 Генерирую график...")
         chart_path = create_line_chart(daily_data, callback.from_user.id, days=7)
@@ -6757,7 +6761,7 @@ async def show_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
         daily_data = get_daily_ratings(callback.from_user.id, days=30)
         if not daily_data:
             msg = await callback.message.answer("❌ Нет данных для графика", reply_markup=rank_back_keyboard())
-            user_temp_messages[callback.from_user.id] = {'stats_result': msg.message_id}
+            user_temp_messages.setdefault(callback.from_user.id, {})['stats_result'] = msg.message_id
             return
         temp_msg = await callback.message.answer("📈 Генерирую график...")
         chart_path = create_line_chart(daily_data, callback.from_user.id, days=30)
