@@ -110,10 +110,10 @@ class DietState(StatesGroup):
 router = Router()
 
 # ============ КОНФИГУРАЦИЯ ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# ============ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ============
+# ============ ОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ============
 user_last_menu: Dict[int, int] = {}
 user_temp_messages: Dict[int, Dict[str, int]] = {}
 user_history_page: Dict[int, int] = {}
