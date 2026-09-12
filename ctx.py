@@ -402,6 +402,7 @@ async def handle_photo_analysis_start(message: Message, bot: Bot, state: FSMCont
     except:
         pass
     await state.clear()
+    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
     intro_msg = await message.answer(
         "📸 Отправь фото для анализа телосложения.\n\nИли нажми «❌ Отмена».",
         reply_markup=photo_analysis_cancel_keyboard()
@@ -495,21 +496,27 @@ async def photo_timeout(message: Message, bot: Bot, state: FSMContext):
 
 # ============ БАЗОВЫЕ ФУНКЦИИ ПОЛЬЗОВАТЕЛЯ ============
 def save_user_settings(user_id: int, username: str, first_name: str):
-    today = datetime.now().strftime('%Y-%m-%d')
+    # NOTE: last_active_date is intentionally NOT set/overwritten here.
+    # It's owned by update_streak()/get_streak() below - if we stamp it with
+    # today's date on every call (which used to happen right before
+    # update_streak() ran), update_streak() would always see last_date ==
+    # today already and could never tell "a new day has started", so the
+    # streak would never increment.
     db.execute('''
         INSERT INTO user_settings (user_id, username, first_name, last_active_date)
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, NULL)
         ON CONFLICT(user_id) DO UPDATE SET 
             username = excluded.username,
-            first_name = excluded.first_name,
-            last_active_date = excluded.last_active_date
-    ''', (user_id, username, first_name, today))
+            first_name = excluded.first_name
+    ''', (user_id, username, first_name))
     db.commit()
 
-def get_user_name(user_id: int) -> str:
+def get_user_name(user_id: int, fallback: Optional[str] = None) -> str:
     cursor = db.execute('SELECT first_name FROM user_settings WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
-    return row[0] if row else "друг"
+    if row and row[0]:
+        return row[0]
+    return fallback or "друг"
 
 def update_streak(user_id: int):
     today = datetime.now().strftime('%Y-%m-%d')
@@ -2549,7 +2556,7 @@ async def handle_reflection(message: Message, bot: Bot, state: FSMContext):
     except:
         pass
     await state.clear()
-    name = get_user_name(message.from_user.id)
+    name = get_user_name(message.from_user.id, message.from_user.first_name)
     old_menu = user_last_menu.get(message.from_user.id)
     if old_menu:
         await delete_message_safe(bot, message.chat.id, old_menu)
@@ -2665,7 +2672,7 @@ async def process_rating(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await state.clear()
     temps = user_temp_messages.get(callback.from_user.id, {})
     await delete_message_safe(bot, callback.message.chat.id, temps.get('rating'))
-    name = get_user_name(callback.from_user.id)
+    name = get_user_name(callback.from_user.id, callback.from_user.first_name)
 
     # Проверяем, заполнены ли все 5 категорий
     all_completed = check_all_categories_completed(callback.from_user.id)
@@ -2753,14 +2760,12 @@ async def handle_ai(message: Message, bot: Bot, state: FSMContext):
     if old_menu:
         await delete_message_safe(bot, message.chat.id, old_menu)
         user_last_menu[user_id] = None
-    # Сохраняем предыдущие ключи (фото, замеры, ИИ)
-    temps = user_temp_messages.get(user_id, {})
-    keys_to_preserve = {'photo_analysis_result', 'photo_user', 'body_fat_measurements', 'body_fat_result', 'ai_advisor', 'ai_response'}
-    preserved = {k: v for k, v in temps.items() if k in keys_to_preserve}
+    # Удаляем оставшиеся временные сообщения других разделов (фото/замеры/ИИ сохраняются)
+    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
+    temps = user_temp_messages.setdefault(user_id, {})
     # Заготовленное сообщение с reply кнопкой
     msg = await message.answer("🤖 CheckAI тут, чем помочь?", reply_markup=ai_reply_keyboard())
-    preserved['ai_advisor'] = msg.message_id
-    user_temp_messages[user_id] = preserved
+    temps['ai_advisor'] = msg.message_id
     await state.set_state(AIAdvisorState.waiting_for_question)
 
 
@@ -2787,7 +2792,7 @@ async def process_ai_question(message: Message, bot: Bot, state: FSMContext):
     # Удаляем вступительное сообщение бота (НЕ вопрос пользователя!)
     await delete_message_safe(bot, message.chat.id, temps.get('ai_advisor'))
     await bot.send_chat_action(message.chat.id, action=ChatAction.TYPING)
-    name = get_user_name(user_id)
+    name = get_user_name(user_id, message.from_user.first_name)
     stats = get_user_stats_for_ai(user_id)
     context = f"""Ты — персональный трекер-ассистент. Пользователь {name}.
     Данные: сегодня {stats['today']}, неделя {stats['week_avg']}, тренировки {stats['workouts']['current_count']}/{stats['workouts']['monthly_goal']}.
@@ -2950,7 +2955,7 @@ async def workout_add_msg(message: Message, bot: Bot, state: FSMContext):
     await state.clear()
     plan_data = get_ai_plan(user_id)
     if not plan_data:
-        name = get_user_name(user_id)
+        name = get_user_name(user_id, message.from_user.first_name)
         msg = await message.answer(
             f"{name}, план тренировок не настроен.\n\nСоздать план с ИИ или введёшь свой?",
             reply_markup=wp_mode_keyboard()
@@ -3451,7 +3456,7 @@ async def wp_choose_manual(callback: CallbackQuery, bot: Bot, state: FSMContext)
 @router.callback_query(F.data == "wp_back_to_mode")
 async def wp_back_to_mode(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await state.set_state(AIPlanState.choosing_mode)
-    name = get_user_name(callback.from_user.id)
+    name = get_user_name(callback.from_user.id, callback.from_user.first_name)
     await callback.message.edit_text(
         f"{name}, давай настроим тренировки!\n\nСоздать план с ИИ или введёшь свой?",
         reply_markup=wp_mode_keyboard()
@@ -4223,7 +4228,7 @@ async def wp_reset(callback: CallbackQuery, bot: Bot, state: FSMContext):
     user_id = callback.from_user.id
     delete_all_workout_data(user_id)
     await state.clear()
-    name = get_user_name(user_id)
+    name = get_user_name(user_id, callback.from_user.first_name)
     await callback.message.edit_text(
         f"{name}, давай настроим тренировки!\n\nСоздать план с ИИ или введёшь свой?",
         reply_markup=wp_mode_keyboard()
@@ -4420,7 +4425,7 @@ async def workout_new_ai_plan_msg(message: Message, bot: Bot, state: FSMContext)
     except:
         pass
     user_id = message.from_user.id
-    name = get_user_name(user_id)
+    name = get_user_name(user_id, message.from_user.first_name)
     temps = user_temp_messages.get(user_id, {})
     await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
     await state.set_state(AIPlanState.choosing_goal)
@@ -5490,13 +5495,9 @@ async def handle_diet(message: Message, bot: Bot, state: FSMContext):
         await state.set_state(DietState.weight)
         await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
         msg = await message.answer("📝 Введи свой вес (в кг):")
-        # Сохраняем предыдущие ключи (фото, замеры)
-        temps = user_temp_messages.get(user_id, {})
-        keys_to_preserve = {'photo_analysis_result', 'photo_user', 'body_fat_measurements', 'body_fat_result'}
-        preserved = {k: v for k, v in temps.items() if k in keys_to_preserve}
-        preserved['diet_setup'] = msg.message_id
-        user_temp_messages[user_id] = preserved
+        user_temp_messages.setdefault(user_id, {})['diet_setup'] = msg.message_id
         return
+    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
     await show_diet_menu(user_id, message.chat.id, bot)
 
 async def show_diet_menu(user_id: int, chat_id: int, bot: Bot):
@@ -6486,6 +6487,7 @@ async def handle_tasks(message: Message, bot: Bot, state: FSMContext):
     if old_menu:
         await delete_message_safe(bot, message.chat.id, old_menu)
         user_last_menu[user_id] = None
+    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
     await show_tasks_menu(user_id, message.chat.id, bot)
 
 @router.callback_query(F.data == "task_noop")
@@ -6713,13 +6715,14 @@ async def handle_stats(message: Message, bot: Bot, state: FSMContext):
     if old_menu:
         await delete_message_safe(bot, message.chat.id, old_menu)
         user_last_menu[message.from_user.id] = None
+    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
     msg = await message.answer("📊 Выбери тип статистики:", reply_markup=stats_keyboard())
     user_temp_messages.setdefault(message.from_user.id, {})['stats_choice'] = msg.message_id
 
 @router.callback_query(F.data.startswith("stats:"))
 async def show_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
     period = callback.data.split(":")[1]
-    name = get_user_name(callback.from_user.id)
+    name = get_user_name(callback.from_user.id, callback.from_user.first_name)
     temps = user_temp_messages.get(callback.from_user.id, {})
     await delete_message_safe(bot, callback.message.chat.id, temps.get('stats_choice'))
     if period == "week":
@@ -6785,7 +6788,7 @@ async def handle_rank(message: Message, bot: Bot, state: FSMContext):
         pass
     await state.clear()
     rank_data = get_or_create_rank_data(message.from_user.id)
-    name = get_user_name(message.from_user.id)
+    name = get_user_name(message.from_user.id, message.from_user.first_name)
     rank_id = rank_data['current_rank']
     total = rank_data['total_sparks']
     needed, next_total = get_sparks_for_next_rank(rank_id, total)
@@ -6800,13 +6803,9 @@ async def handle_rank(message: Message, bot: Bot, state: FSMContext):
 📊 Осталось до следующего ранга: {needed}
 
 <i>{get_rank_motivation(rank_id)}</i>"""
+    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
     msg = await message.answer(text, parse_mode="HTML", reply_markup=rank_back_keyboard())
-    # Сохраняем предыдущие ключи (фото, замеры)
-    temps = user_temp_messages.get(message.from_user.id, {})
-    keys_to_preserve = {'photo_analysis_result', 'photo_user', 'body_fat_measurements', 'body_fat_result'}
-    preserved = {k: v for k, v in temps.items() if k in keys_to_preserve}
-    preserved['rank'] = msg.message_id
-    user_temp_messages[message.from_user.id] = preserved
+    user_temp_messages.setdefault(message.from_user.id, {})['rank'] = msg.message_id
     
     
 def generate_proactive_ai_message(user_id: int) -> str:
