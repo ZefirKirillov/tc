@@ -188,6 +188,30 @@ class Database:
 
 db = Database()
 
+def log_db_persistence_diagnostics():
+    """Печатает в лог, откуда фактически читается/пишется БД при каждом старте.
+    Полезно для диагностики 'после редеплоя бот всё забыл' - если абсолютный
+    путь или количество строк в таблицах каждый раз разные, значит файл БД
+    не сохраняется между деплоями (нужен persistent volume на этом пути)."""
+    abs_path = os.path.abspath(DB_PATH)
+    existed_before = os.path.exists(abs_path)
+    size = os.path.getsize(abs_path) if existed_before else 0
+    print(f"[DB] DB_PATH env: {os.environ.get('DB_PATH', '<не задан, используется default tracker.db>')}")
+    print(f"[DB] Абсолютный путь к файлу БД: {abs_path}")
+    print(f"[DB] Файл существовал до старта: {existed_before} (размер: {size} байт)")
+    if not os.environ.get('DB_PATH'):
+        print("[DB] ⚠️ DB_PATH не задан через переменную окружения - используется относительный "
+              "путь 'tracker.db' в рабочей директории процесса. На большинстве хостингов "
+              "(Railway/Render/Fly.io/Docker без volume) файловая система контейнера "
+              "пересоздаётся при каждом деплое, и этот файл будет каждый раз новым/пустым. "
+              "Смонтируйте persistent volume и укажите DB_PATH на путь внутри него.")
+    try:
+        tasks_count = db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        ratings_count = db.execute("SELECT COUNT(*) FROM ratings").fetchone()[0]
+        print(f"[DB] Текущие данные: tasks={tasks_count}, ratings={ratings_count}")
+    except Exception as e:
+        print(f"[DB] Не удалось прочитать счётчики строк (возможно таблицы ещё не созданы): {e}")
+
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def get_current_rank(total_sparks: int) -> int:
     current_rank = 1
@@ -613,6 +637,85 @@ def get_user_stats_for_ai(user_id: int) -> dict:
         'workouts': workout_data,
         'rank': rank_data
     }
+
+def get_full_context_for_ai(user_id: int) -> str:
+    """Собирает свежую сводку по рефлексии, диете, тренировкам и задачам,
+    чтобы ответы и советы ИИ были персонализированы под конкретного пользователя."""
+    lines = []
+
+    # --- Рефлексия ---
+    stats = get_user_stats_for_ai(user_id)
+    today_r = stats['today']
+    yesterday_r = stats['yesterday']
+    week_avg = stats['week_avg']
+    if today_r:
+        lines.append("Рефлексия сегодня: " + ", ".join(f"{cat} {val}/10" for cat, val in today_r.items()))
+    else:
+        lines.append("Рефлексия сегодня: ещё не заполнена.")
+    if yesterday_r:
+        lines.append("Рефлексия вчера: " + ", ".join(f"{cat} {val}/10" for cat, val in yesterday_r.items()))
+    if week_avg:
+        lines.append("Средние оценки за 7 дней: " + ", ".join(f"{cat} {val:.1f}" for cat, val in week_avg.items()))
+
+    # --- Диета ---
+    try:
+        profile = get_diet_profile(user_id)
+    except Exception:
+        profile = None
+    if profile:
+        today_cal = get_today_calories(user_id)
+        goal = profile.get('daily_calories') or 0
+        lines.append(f"Диета: цель {int(goal)} ккал/день, съедено сегодня {int(today_cal)} ккал.")
+        food_log = get_today_food_log(user_id)
+        if food_log:
+            food_items = "; ".join(f"{meal}: {desc} ({int(cal)} ккал)" for meal, desc, cal in food_log)
+            lines.append(f"Еда сегодня: {food_items}")
+        last_weight = get_last_weight(user_id)
+        if last_weight:
+            lines.append(f"Последний зафиксированный вес: {last_weight} кг")
+    else:
+        lines.append("Диета: профиль питания ещё не настроен.")
+
+    # --- Тренировки ---
+    workouts = stats['workouts'] or {}
+    lines.append(
+        f"Тренировки в этом месяце: {workouts.get('current_count', 0)}/{workouts.get('monthly_goal', 0)}"
+    )
+    try:
+        cursor = db.execute("""
+            SELECT date, status, skip_reason FROM ai_workout_sessions
+            WHERE user_id = ? AND status != 'pending'
+            ORDER BY date DESC LIMIT 5
+        """, (user_id,))
+        recent_sessions = cursor.fetchall()
+    except Exception:
+        recent_sessions = []
+    if recent_sessions:
+        sess_lines = []
+        for date, status, skip_reason in recent_sessions:
+            if status == 'done':
+                sess_lines.append(f"{date}: выполнена")
+            elif status == 'skipped':
+                reason = f" ({skip_reason})" if skip_reason else ""
+                sess_lines.append(f"{date}: пропущена{reason}")
+            else:
+                sess_lines.append(f"{date}: {status}")
+        lines.append("Последние тренировки: " + "; ".join(sess_lines))
+
+    # --- Задачи ---
+    try:
+        tasks = get_tasks_for_today(user_id)
+    except Exception:
+        tasks = []
+    if tasks:
+        task_lines = []
+        for t in tasks:
+            mark = "🔥" if t.get('is_priority') else "-"
+            done = " ✅" if t.get('is_done') else ""
+            task_lines.append(f"{mark} {t['title']}{done}")
+        lines.append("Задачи на сегодня: " + "; ".join(task_lines))
+
+    return "\n".join(lines)
 
 # ============ ФУНКЦИИ РАНГОВ И ИСКР ============
 def _fetch_rank_data(user_id: int) -> dict:
@@ -1981,7 +2084,10 @@ def rating_keyboard():
 
 def ai_reply_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔙 Назад в меню")]],
+        keyboard=[
+            [KeyboardButton(text="💡 Дай мне совет")],
+            [KeyboardButton(text="🔙 Назад в меню")]
+        ],
         resize_keyboard=True, one_time_keyboard=False
     )
 
@@ -2549,29 +2655,33 @@ async def handle_start_button(message: Message, bot: Bot):
     await send_main_menu(bot, user_id, message.chat.id)
 
 # ---------- РЕФЛЕКСИЯ ----------
+async def show_reflection_menu(user_id: int, chat_id: int, bot: Bot, state: FSMContext, fallback_name: Optional[str] = None):
+    await state.clear()
+    name = get_user_name(user_id, fallback_name)
+    old_menu = user_last_menu.get(user_id)
+    if old_menu:
+        await delete_message_safe(bot, chat_id, old_menu)
+        user_last_menu[user_id] = None
+    temps = user_temp_messages.get(user_id, {})
+    await delete_message_safe(bot, chat_id, temps.pop('reflection', None))
+    await delete_message_safe(bot, chat_id, temps.pop('tasks_menu', None))
+    # Проверяем, заполнены ли все категории — если да, запоминаем для последующего возврата в меню
+    if check_all_categories_completed(user_id):
+        temps['all_categories_filled'] = True
+    else:
+        temps.pop('all_categories_filled', None)
+    user_temp_messages[user_id] = temps
+    msg = await bot.send_message(chat_id, f"{name}, что оценим?", reply_markup=reflection_keyboard())
+    user_temp_messages[user_id]['reflection'] = msg.message_id
+
 @router.message(F.text == "📒 Рефлексия")
 async def handle_reflection(message: Message, bot: Bot, state: FSMContext):
     try:
         await message.delete()
     except:
         pass
-    await state.clear()
-    name = get_user_name(message.from_user.id, message.from_user.first_name)
-    old_menu = user_last_menu.get(message.from_user.id)
-    if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
-        user_last_menu[message.from_user.id] = None
-    temps = user_temp_messages.get(message.from_user.id, {})
-    await delete_message_safe(bot, message.chat.id, temps.pop('reflection', None))
-    await delete_message_safe(bot, message.chat.id, temps.pop('tasks_menu', None))
-    # Проверяем, заполнены ли все категории — если да, запоминаем для последующего возврата в меню
-    if check_all_categories_completed(message.from_user.id):
-        temps['all_categories_filled'] = True
-    else:
-        temps.pop('all_categories_filled', None)
-    user_temp_messages[message.from_user.id] = temps
-    msg = await message.answer(f"{name}, что оценим?", reply_markup=reflection_keyboard())
-    user_temp_messages[message.from_user.id]['reflection'] = msg.message_id
+    await show_reflection_menu(message.from_user.id, message.chat.id, bot, state, message.from_user.first_name)
+
 
 @router.message(F.text.in_(["😴 Сон", "🍽 Еда", "💪 Активность", "🎮 Зависание", "🎯 Настрой"]))
 async def handle_category(message: Message, bot: Bot, state: FSMContext):
@@ -2689,7 +2799,7 @@ async def process_rating(callback: CallbackQuery, bot: Bot, state: FSMContext):
         if all_completed or all_filled_flag:
             temps['all_categories_filled'] = True
         user_temp_messages[callback.from_user.id] = temps
-        await handle_reflection(callback.message, bot, state)
+        await show_reflection_menu(callback.from_user.id, callback.message.chat.id, bot, state, callback.from_user.first_name)
     else:
         if all_completed:
             success, sparks_today, rank_up, old_rank, new_rank = add_spark(callback.from_user.id, 'categories')
@@ -2712,7 +2822,7 @@ async def process_rating(callback: CallbackQuery, bot: Bot, state: FSMContext):
         else:
             # Не все категории заполнены — показываем рефлексию снова
             await delete_message_safe(bot, callback.message.chat.id, callback.message.message_id)
-            await handle_reflection(callback.message, bot, state)
+            await show_reflection_menu(callback.from_user.id, callback.message.chat.id, bot, state, callback.from_user.first_name)
     await callback.answer("✅ Сохранено!")
 
 @router.callback_query(F.data.startswith("analyze_low:"))
@@ -2744,7 +2854,7 @@ async def skip_analysis(callback: CallbackQuery, bot: Bot, state: FSMContext):
         await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
         await send_main_menu(bot, callback.from_user.id, callback.message.chat.id)
     else:
-        await handle_reflection(callback.message, bot, state)
+        await show_reflection_menu(callback.from_user.id, callback.message.chat.id, bot, state, callback.from_user.first_name)
     await callback.answer()
 
 # ---------- ИИ-СОВЕТЧИК ----------
@@ -2781,6 +2891,70 @@ async def wp_edit_retry(callback: CallbackQuery, bot: Bot, state: FSMContext):
     )
     await callback.answer()
 
+@router.message(F.text == "💡 Дай мне совет")
+async def handle_ai_advice(message: Message, bot: Bot, state: FSMContext):
+    user_id = message.from_user.id
+    try:
+        await message.delete()
+    except:
+        pass
+    temps = user_temp_messages.get(user_id, {})
+    # Удаляем вступительное сообщение бота (если ещё не удалено)
+    await delete_message_safe(bot, message.chat.id, temps.get('ai_advisor'))
+    await bot.send_chat_action(message.chat.id, action=ChatAction.TYPING)
+    name = get_user_name(user_id, message.from_user.first_name)
+    full_context = get_full_context_for_ai(user_id)
+    prompt = f"""Ты — персональный трекер-ассистент. Пользователь {name}.
+
+Вот свежие данные пользователя:
+{full_context}
+
+Дай короткий персональный совет (3-5 предложений): что идёт хорошо, на что обратить внимание, и один конкретный шаг на сегодня/завтра.
+Обращайся по имени, используй эмодзи, пиши по-русски."""
+    # Animation while generating
+    phrases_ai = ["Думаю.", "Думаю..", "Думаю...", "Анализирую.", "Анализирую..", "Анализирую..."]
+    stop_ai = asyncio.Event()
+    tmp = await message.answer("Думаю...")
+    ai_msg_id = tmp.message_id
+    temps['ai_advisor'] = ai_msg_id
+    user_temp_messages[user_id] = temps
+
+    async def animate_ai():
+        i = 0
+        while not stop_ai.is_set():
+            try:
+                await bot.edit_message_text(phrases_ai[i % len(phrases_ai)],
+                                             message.chat.id, ai_msg_id)
+            except:
+                pass
+            await asyncio.sleep(1)
+            i += 1
+    anim = asyncio.create_task(animate_ai())
+    try:
+        answer = await run_in_thread(gemini_generate, prompt, 8192)
+    finally:
+        stop_ai.set()
+        anim.cancel()
+        try:
+            await anim
+        except asyncio.CancelledError:
+            pass
+    try:
+        await bot.edit_message_text(
+            f"💡 <b>Совет:</b>\n\n{answer}",
+            message.chat.id, ai_msg_id,
+            parse_mode="HTML", reply_markup=ai_reply_keyboard()
+        )
+    except Exception:
+        await delete_message_safe(bot, message.chat.id, ai_msg_id)
+        msg = await message.answer(f"💡 <b>Совет:</b>\n\n{answer}",
+                                    parse_mode="HTML", reply_markup=ai_reply_keyboard())
+        ai_msg_id = msg.message_id
+    temps['ai_response'] = ai_msg_id
+    user_temp_messages[user_id] = temps
+    save_last_ai_answer(user_id, answer)
+    await state.set_state(AIAdvisorState.waiting_for_question)
+
 @router.message(AIAdvisorState.waiting_for_question)
 async def process_ai_question(message: Message, bot: Bot, state: FSMContext):
     question = message.text.strip()
@@ -2793,11 +2967,14 @@ async def process_ai_question(message: Message, bot: Bot, state: FSMContext):
     await delete_message_safe(bot, message.chat.id, temps.get('ai_advisor'))
     await bot.send_chat_action(message.chat.id, action=ChatAction.TYPING)
     name = get_user_name(user_id, message.from_user.first_name)
-    stats = get_user_stats_for_ai(user_id)
+    full_context = get_full_context_for_ai(user_id)
     context = f"""Ты — персональный трекер-ассистент. Пользователь {name}.
-    Данные: сегодня {stats['today']}, неделя {stats['week_avg']}, тренировки {stats['workouts']['current_count']}/{stats['workouts']['monthly_goal']}.
-    Вопрос: {question}
-    Ответь кратко, конкретно, с эмодзи, обращайся по имени."""
+
+Вот свежие данные пользователя:
+{full_context}
+
+Вопрос: {question}
+Ответь кратко, конкретно, с эмодзи, обращайся по имени."""
     # Animation while generating
     phrases_ai = ["Думаю.", "Думаю..", "Думаю...", "Анализирую.", "Анализирую..", "Анализирую..."]
     stop_ai = asyncio.Event()
@@ -6884,6 +7061,7 @@ async def main():
     print("[BOOT] Старт...")
     init_db()
     print("[BOOT] База инициализирована")
+    log_db_persistence_diagnostics()
     
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
