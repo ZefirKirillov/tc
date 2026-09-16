@@ -7,6 +7,7 @@ import os
 import re
 import math
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Tuple, List, Any
 from collections import defaultdict
 import io
@@ -36,6 +37,7 @@ from google.genai import types
 # ============ СОСТОЯНИЯ ============
 class RatingState(StatesGroup):
     waiting_for_rating = State()
+    waiting_for_mood_text = State()
 
 class WorkoutState(StatesGroup):
     waiting_for_goal = State()
@@ -276,6 +278,10 @@ async def delete_message_safe(bot: Bot, chat_id: int, message_id: Optional[int])
         except Exception as e:
             print(f"[BOT] Ошибка удаления сообщения {message_id}: {e}")
 
+async def delete_message_after_delay(bot: Bot, chat_id: int, message_id: Optional[int], delay: int = 10):
+    await asyncio.sleep(delay)
+    await delete_message_safe(bot, chat_id, message_id)
+
 async def delete_temp_messages(bot: Bot, user_id: int, chat_id: int, keep_ai: bool = True):
     """Удаляет все временные сообщения кроме явно сохранённых."""
     temps = user_temp_messages.get(user_id, {})
@@ -406,6 +412,40 @@ def gemini_generate_json(prompt: str, max_tokens: int = 8192) -> str:
         print(f"[GEMINI_JSON] Ошибка: {e}")
         traceback.print_exc()
         return ""
+
+def gemini_generate_rating(prompt: str, max_tokens: int = 1024) -> Optional[dict]:
+    """Вызов Gemini через ОТДЕЛЬНЫЙ API-ключ (GOOGLE_API_KEY_RATINGS), используется
+    только для авто-оценки категорий 'еда'/'активность'/'настрой'. Модель должна
+    ответить JSON {"rating": 1-10, "comment": "..."}. Возвращает None если ключ
+    не настроен или запрос не удался — вызывающий код должен в этом случае
+    откатиться на ручной ввод оценки, а не выдумывать число."""
+    api_key = os.environ.get("GOOGLE_API_KEY_RATINGS") or os.environ.get("GEMINI_API_KEY_RATINGS")
+    if not api_key:
+        return None
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+                thinking_config=types.ThinkingConfig(thinking_budget=0)
+            )
+        )
+        text = getattr(response, 'text', None)
+        if not text and response.candidates and response.candidates[0].content.parts:
+            text = response.candidates[0].content.parts[0].text
+        if not text:
+            return None
+        text = text.strip()
+        text = re.sub(r'^```json\s*|\s*```$', '', text).strip()
+        data = json.loads(text)
+        rating = max(1, min(10, int(round(float(data.get('rating'))))))
+        comment = str(data.get('comment', '')).strip()
+        return {'rating': rating, 'comment': comment}
+    except Exception as e:
+        print(f"[GEMINI-RATINGS] Ошибка: {e}")
+        return None
 
 def photo_analysis_cancel_keyboard():
     return ReplyKeyboardMarkup(
@@ -542,9 +582,61 @@ def get_user_name(user_id: int, fallback: Optional[str] = None) -> str:
         return row[0]
     return fallback or "друг"
 
+# ---------- ЧАСОВЫЕ ПОЯСА ----------
+DEFAULT_TIMEZONE = "Europe/Moscow"
+
+# Несколько самых популярных часовых поясов России (для быстрого выбора кнопками)
+RUSSIAN_TIMEZONES = [
+    ("Калининград (UTC+2)", "Europe/Kaliningrad"),
+    ("Москва (UTC+3)", "Europe/Moscow"),
+    ("Самара (UTC+4)", "Europe/Samara"),
+    ("Екатеринбург (UTC+5)", "Asia/Yekaterinburg"),
+    ("Омск (UTC+6)", "Asia/Omsk"),
+    ("Красноярск (UTC+7)", "Asia/Krasnoyarsk"),
+    ("Иркутск (UTC+8)", "Asia/Irkutsk"),
+    ("Владивосток (UTC+10)", "Asia/Vladivostok"),
+]
+
+def get_user_timezone(user_id: int) -> str:
+    cursor = db.execute('SELECT timezone FROM user_settings WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        return row[0]
+    return DEFAULT_TIMEZONE
+
+def set_user_timezone(user_id: int, tz_name: str):
+    db.execute('''
+        INSERT INTO user_settings (user_id, timezone) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET timezone = excluded.timezone
+    ''', (user_id, tz_name))
+    db.commit()
+
+def _resolve_tz(tz_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo(DEFAULT_TIMEZONE)
+
+def user_now(user_id: int) -> datetime:
+    """Текущее время в часовом поясе пользователя (а не сервера)."""
+    return datetime.now(_resolve_tz(get_user_timezone(user_id)))
+
+def user_today_str(user_id: int, fmt: str = '%Y-%m-%d') -> str:
+    return user_now(user_id).strftime(fmt)
+
+def user_today_date(user_id: int):
+    return user_now(user_id).date()
+
+def user_weekday(user_id: int) -> int:
+    return user_now(user_id).weekday()
+
+def timezone_picker_keyboard(context: str = "onboarding"):
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"tz:{tz}:{context}")] for label, tz in RUSSIAN_TIMEZONES]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 def update_streak(user_id: int):
-    today = datetime.now().strftime('%Y-%m-%d')
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
+    yesterday = (user_now(user_id) - timedelta(days=1)).strftime('%Y-%m-%d')
     cursor = db.execute('SELECT streak_days, last_active_date FROM user_settings WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     if row:
@@ -560,8 +652,8 @@ def update_streak(user_id: int):
         db.commit()
 
 def get_streak(user_id: int) -> int:
-    today = datetime.now().strftime('%Y-%m-%d')
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
+    yesterday = (user_now(user_id) - timedelta(days=1)).strftime('%Y-%m-%d')
     cursor = db.execute('SELECT streak_days, last_active_date FROM user_settings WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     if not row:
@@ -586,7 +678,7 @@ def save_rating(user_id: int, category: str, rating: int, date: str):
     db.commit()
 
 def get_ratings(user_id: int, days: int = 1) -> list:
-    date_from = (datetime.now() - timedelta(days=days-1)).strftime('%Y-%m-%d')
+    date_from = (user_now(user_id) - timedelta(days=days-1)).strftime('%Y-%m-%d')
     valid_categories = ('сон', 'еда', 'активность', 'зависание', 'настрой')
     cursor = db.execute('''
         SELECT category, AVG(rating) as avg_rating, COUNT(*) as count
@@ -597,7 +689,7 @@ def get_ratings(user_id: int, days: int = 1) -> list:
     return cursor.fetchall()
 
 def get_daily_ratings(user_id: int, days: int = 7) -> list:
-    date_from = (datetime.now() - timedelta(days=days-1)).strftime('%Y-%m-%d')
+    date_from = (user_now(user_id) - timedelta(days=days-1)).strftime('%Y-%m-%d')
     valid_categories = ('сон', 'еда', 'активность', 'зависание', 'настрой')
     cursor = db.execute('''
         SELECT day_date, category, rating
@@ -608,7 +700,7 @@ def get_daily_ratings(user_id: int, days: int = 7) -> list:
     return cursor.fetchall()
 
 def get_today_ratings(user_id: int) -> dict:
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     cursor = db.execute('''
         SELECT category, rating FROM ratings 
         WHERE user_id = ? AND day_date = ?
@@ -616,7 +708,7 @@ def get_today_ratings(user_id: int) -> dict:
     return {r[0]: r[1] for r in cursor.fetchall()}
 
 def get_yesterday_ratings(user_id: int) -> dict:
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    yesterday = (user_now(user_id) - timedelta(days=1)).strftime('%Y-%m-%d')
     cursor = db.execute('''
         SELECT category, rating FROM ratings 
         WHERE user_id = ? AND day_date = ?
@@ -717,11 +809,86 @@ def get_full_context_for_ai(user_id: int) -> str:
 
     return "\n".join(lines)
 
+# ============ АВТО-ОЦЕНКА ЕДЫ / АКТИВНОСТИ (через ИИ, отдельный ключ) ============
+def sync_diet_rating_for_today(user_id: int):
+    """Пересчитывает оценку категории 'еда' за сегодня на основе фактически
+    залогированной еды. Вызывается после каждой новой записи о еде.
+    Если GOOGLE_API_KEY_RATINGS не настроен - ничего не делает (не выдумывает оценку)."""
+    food_log = get_today_food_log(user_id)
+    if not food_log:
+        return
+    profile = get_diet_profile(user_id)
+    goal = profile.get('daily_calories') if profile else None
+    today_cal = get_today_calories(user_id)
+    food_items = "; ".join(f"{meal}: {desc} ({int(cal)} ккал)" for meal, desc, cal in food_log)
+    prompt = f"""Ты оцениваешь качество питания пользователя за сегодня по шкале от 1 до 10.
+Дневная цель по калориям: {int(goal) if goal else 'не задана'} ккал.
+Съедено сегодня: {int(today_cal)} ккал.
+Приёмы пищи: {food_items}
+
+10 — питание сбалансированное, разнообразное и укладывается в цель по калориям.
+1 — питание явно вредное или сильно выходит за рамки цели.
+Ответь СТРОГО в формате JSON без пояснений: {{"rating": <целое число 1-10>, "comment": "<одно короткое предложение по-русски>"}}"""
+    result = gemini_generate_rating(prompt)
+    if result:
+        save_rating(user_id, 'еда', result['rating'], user_today_str(user_id))
+
+def sync_activity_rating_for_today(user_id: int):
+    """Пересчитывает оценку категории 'активность' за сегодня на основе фактически
+    выполненной тренировки. Вызывается сразу после завершения тренировки."""
+    session = get_today_session(user_id)
+    if not session or session.get('status') != 'done':
+        return
+    logs = get_session_exercise_logs(session['id'])
+    if logs:
+        log_lines = []
+        for log in logs:
+            if log.get('status') == 'skipped':
+                log_lines.append(f"{log['exercise_name']}: пропущено")
+            else:
+                result = log.get('result') or {}
+                log_lines.append(f"{log['exercise_name']}: {result}")
+        exercises_summary = "; ".join(log_lines)
+    else:
+        exercises_summary = "нет подробных данных, но сессия отмечена как выполненная"
+    prompt = f"""Ты оцениваешь качество сегодняшней тренировки пользователя по шкале от 1 до 10
+на основе того, что реально выполнено.
+Упражнения: {exercises_summary}
+
+10 — тренировка выполнена полностью и качественно.
+Ниже — если многое пропущено, сделано не полностью или с явными трудностями.
+Ответь СТРОГО в формате JSON без пояснений: {{"rating": <целое число 1-10>, "comment": "<одно короткое предложение по-русски>"}}"""
+    result = gemini_generate_rating(prompt)
+    if result:
+        save_rating(user_id, 'активность', result['rating'], user_today_str(user_id))
+
+async def finalize_daily_ratings_for_timezone(tz_name: str):
+    """Раз в сутки (23:55 по местному времени каждого часового пояса): если 'еда' или
+    'активность' за сегодня так и не были залогированы - проставляет 0, а для
+    активности - 5, если по плану сегодня был день отдыха."""
+    try:
+        if tz_name == DEFAULT_TIMEZONE:
+            cursor = db.execute("SELECT user_id FROM user_settings WHERE timezone = ? OR timezone IS NULL", (tz_name,))
+        else:
+            cursor = db.execute("SELECT user_id FROM user_settings WHERE timezone = ?", (tz_name,))
+        user_ids = [r[0] for r in cursor.fetchall()]
+        for user_id in user_ids:
+            today = user_today_str(user_id)
+            today_ratings = get_today_ratings(user_id)
+            if 'еда' not in today_ratings:
+                save_rating(user_id, 'еда', 0, today)
+            if 'активность' not in today_ratings:
+                plan_data = get_ai_plan(user_id)
+                is_rest_day = bool(plan_data) and not get_today_plan(plan_data, user_id)
+                save_rating(user_id, 'активность', 5 if is_rest_day else 0, today)
+    except Exception as e:
+        print(f"[FINALIZE RATINGS] Ошибка для {tz_name}: {e}")
+
 # ============ ФУНКЦИИ РАНГОВ И ИСКР ============
 def _fetch_rank_data(user_id: int) -> dict:
     cursor = db.execute('SELECT * FROM user_ranks WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     if row:
         user_id, total_sparks, current_rank, last_spark_date, sparks_today, cat_completed, workout_completed = row
         if last_spark_date != today:
@@ -770,6 +937,15 @@ def check_all_categories_completed(user_id: int) -> bool:
     required_categories = {'сон', 'еда', 'активность', 'зависание', 'настрой'}
     return required_categories.issubset(set(today_ratings.keys()))
 
+def manual_categories_completed(user_id: int) -> bool:
+    """'еда' и 'активность' теперь выставляются автоматически (после лога еды/тренировки
+    или в конце дня), а не кнопками. Эта проверка - только по трём категориям, которые
+    пользователь реально заполняет сам, чтобы не зацикливать его в меню рефлексии,
+    ожидая недостижимых вручную оценок."""
+    today_ratings = get_today_ratings(user_id)
+    required_categories = {'сон', 'зависание', 'настрой'}
+    return required_categories.issubset(set(today_ratings.keys()))
+
 def _deduct_spark_for_skip(user_id: int):
     """Отнимает 1 искру за пропущенный тренировочный день."""
     cursor = db.execute('SELECT total_sparks, current_rank FROM user_ranks WHERE user_id = ?', (user_id,))
@@ -793,7 +969,7 @@ def add_spark(user_id: int, spark_type: str) -> Tuple[bool, int, bool, int, int]
     if spark_type == 'workout' and data['workout_completed_today']:
         return (False, data['sparks_today'], False, data['current_rank'], data['current_rank'])
     old_rank = data['current_rank']
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     if spark_type == 'categories':
         db.execute('''
             UPDATE user_ranks 
@@ -818,8 +994,8 @@ def add_spark(user_id: int, spark_type: str) -> Tuple[bool, int, bool, int, int]
 def get_or_create_workout_data(user_id: int) -> dict:
     cursor = db.execute('SELECT * FROM workouts WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
-    today = datetime.now().strftime('%Y-%m-%d')
-    current_month = datetime.now().strftime('%Y-%m')
+    today = user_today_str(user_id)
+    current_month = user_today_str(user_id, '%Y-%m')
     if row:
         user_id, goal, count, last_date, today_count = row
         if last_date:
@@ -863,11 +1039,11 @@ def set_workout_goal(user_id: int, goal: int):
         INSERT INTO workouts (user_id, monthly_goal, current_count, last_workout_date, today_count)
         VALUES (?, ?, 0, ?, 0)
         ON CONFLICT(user_id) DO UPDATE SET monthly_goal = excluded.monthly_goal
-    ''', (user_id, goal, datetime.now().strftime('%Y-%m-%d')))
+    ''', (user_id, goal, user_today_str(user_id)))
     db.commit()
 
 def add_workout(user_id: int) -> dict:
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     db.execute('''
         UPDATE workouts 
         SET current_count = current_count + 1, today_count = today_count + 1, last_workout_date = ?
@@ -884,7 +1060,7 @@ def change_workout_goal(user_id: int, new_goal: int):
 def save_diet_profile(user_id: int, weight: float, height: float, age: int, gender: str,
                       activity_level: float, goal_type: str, target_weight_change: float,
                       target_days: int, daily_calories: float):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     db.execute('''
         INSERT INTO diet_profile (user_id, weight, height, age, gender, activity_level,
                                    goal_type, target_weight_change, target_days, daily_calories, last_update_date)
@@ -912,7 +1088,7 @@ def get_diet_profile(user_id: int) -> Optional[dict]:
     return None
 
 def save_food_log(user_id: int, meal_type: str, description: str, calories: float):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     db.execute('''
         INSERT INTO diet_log (user_id, date, meal_type, food_description, calories)
         VALUES (?, ?, ?, ?, ?)
@@ -920,13 +1096,13 @@ def save_food_log(user_id: int, meal_type: str, description: str, calories: floa
     db.commit()
 
 def get_today_calories(user_id: int) -> float:
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     cursor = db.execute('SELECT SUM(calories) FROM diet_log WHERE user_id = ? AND date = ?', (user_id, today))
     row = cursor.fetchone()
     return row[0] if row[0] else 0.0
 
 def get_today_food_log(user_id: int) -> list:
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     cursor = db.execute('''
         SELECT meal_type, food_description, calories FROM diet_log
         WHERE user_id = ? AND date = ?
@@ -935,7 +1111,7 @@ def get_today_food_log(user_id: int) -> list:
     return cursor.fetchall()
 
 def save_weight_log(user_id: int, weight: float):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     db.execute('INSERT INTO weight_log (user_id, date, weight) VALUES (?, ?, ?)', (user_id, today, weight))
     db.commit()
 
@@ -945,7 +1121,7 @@ def get_last_weight(user_id: int) -> Optional[float]:
     return row[0] if row else None
 
 def save_body_fat(user_id: int, body_fat: float):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     db.execute('INSERT INTO body_fat_log (user_id, date, body_fat) VALUES (?, ?, ?)', (user_id, today, body_fat))
     db.commit()
 
@@ -1048,8 +1224,8 @@ def format_goal_button_text(exercise: dict) -> str:
 
 # ============ ФУНКЦИИ ДЛЯ ЗАДАЧ ============
 def get_tasks_for_today(user_id: int) -> list:
-    today = datetime.now().strftime('%Y-%m-%d')
-    today_wd = str(datetime.now().weekday())
+    today = user_today_str(user_id)
+    today_wd = str(user_weekday(user_id))
     cursor = db.execute("""
         SELECT id, title, is_priority, deadline, repeat_days, is_done, done_date
         FROM tasks WHERE user_id = ?
@@ -1077,8 +1253,8 @@ def get_tasks_for_today(user_id: int) -> list:
     return result
 
 def get_all_active_tasks(user_id: int) -> list:
-    today = datetime.now().strftime('%Y-%m-%d')
-    today_wd = str(datetime.now().weekday())
+    today = user_today_str(user_id)
+    today_wd = str(user_weekday(user_id))
     cursor = db.execute("""
         SELECT id, title, is_priority, deadline, repeat_days, is_done, done_date
         FROM tasks WHERE user_id = ? ORDER BY is_priority DESC, deadline ASC NULLS LAST, id ASC
@@ -1107,7 +1283,7 @@ def get_all_active_tasks(user_id: int) -> list:
 
 def get_urgent_tasks_for_menu(user_id: int) -> list:
     """Задачи для главного меню: приоритетные + дедлайн <= 3 дней."""
-    today = datetime.now().date()
+    today = user_today_date(user_id)
     tasks = get_tasks_for_today(user_id)
     urgent = []
     for t in tasks:
@@ -1125,7 +1301,7 @@ def get_urgent_tasks_for_menu(user_id: int) -> list:
     return urgent[:5]
 
 def complete_task(task_id: int, user_id: int):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
     cursor = db.execute('SELECT repeat_days FROM tasks WHERE id = ? AND user_id = ?', (task_id, user_id))
     row = cursor.fetchone()
     if not row:
@@ -1148,10 +1324,11 @@ def add_task(user_id: int, title: str, is_priority: bool, deadline: Optional[str
     """, (user_id, title, int(is_priority), deadline, repeat_days))
     db.commit()
 
-def days_left_str(deadline: str) -> str:
+def days_left_str(deadline: str, user_id: Optional[int] = None) -> str:
     try:
         dl = datetime.strptime(deadline, '%Y-%m-%d').date()
-        diff = (dl - datetime.now().date()).days
+        today = user_today_date(user_id) if user_id is not None else datetime.now().date()
+        diff = (dl - today).days
         if diff < 0:
             return "просрочена!"
         elif diff == 0:
@@ -1194,7 +1371,7 @@ def get_ai_plan(user_id: int) -> Optional[dict]:
 
 def save_ai_plan(user_id: int, mode: str, goal: str, level: str,
                  days_per_week: int, plan: dict, cycle_weeks: int = 1):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = user_today_str(user_id)
     plan_json = json.dumps(plan, ensure_ascii=False)
     db.execute("""
         INSERT INTO ai_workout_plan (user_id, mode, goal, level, days_per_week, plan_json, cycle_weeks, start_date, last_monthly_review)
@@ -1218,13 +1395,14 @@ def delete_all_workout_data(user_id: int):
     db.execute("UPDATE workouts SET current_count=0, today_count=0, last_workout_date=NULL WHERE user_id = ?", (user_id,))
     db.commit()
 
-def get_current_week_session_key(plan_data: dict, start_date: str) -> str:
+def get_current_week_session_key(plan_data: dict, start_date: str, user_id: Optional[int] = None) -> str:
     """Определяет какую неделю цикла использовать сегодня."""
+    now_date = user_today_date(user_id) if user_id is not None else datetime.now().date()
     try:
         start = datetime.strptime(start_date, "%Y-%m-%d").date()
     except Exception:
-        start = datetime.now().date()
-    today = datetime.now().date()
+        start = now_date
+    today = now_date
     weeks_passed = max(0, (today - start).days // 7)
     # cycle_weeks может быть в plan_data или в вложенном plan
     plan = plan_data.get("plan", plan_data)
@@ -1232,16 +1410,17 @@ def get_current_week_session_key(plan_data: dict, start_date: str) -> str:
     week_idx = (weeks_passed % cycle_weeks) + 1
     return f"week_{week_idx}"
 
-def get_today_plan(plan_data: dict) -> Optional[list]:
-    """Возвращает список упражнений на сегодня или None если день отдыха."""
+def get_today_plan(plan_data: dict, user_id: Optional[int] = None) -> Optional[list]:
+    """Возвращает список упражнений на сегодня (по времени пользователя) или None если день отдыха."""
     if not plan_data:
         return None
     plan = plan_data.get("plan")
     if not plan:
         return None
-    start_date = plan_data.get("start_date") or datetime.now().strftime("%Y-%m-%d")
-    week_key = get_current_week_session_key(plan_data, start_date)
-    today_key = WEEKDAY_KEY[datetime.now().weekday()]
+    now = user_now(user_id) if user_id is not None else datetime.now()
+    start_date = plan_data.get("start_date") or now.strftime("%Y-%m-%d")
+    week_key = get_current_week_session_key(plan_data, start_date, user_id)
+    today_key = WEEKDAY_KEY[now.weekday()]
     week = plan.get(week_key) or plan.get("week_1") or {}
     exercises = week.get(today_key)
     if not exercises:
@@ -1251,7 +1430,7 @@ def get_today_plan(plan_data: dict) -> Optional[list]:
     return exercises
 
 def get_today_session(user_id: int) -> Optional[dict]:
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = user_today_str(user_id)
     cursor = db.execute(
         "SELECT * FROM ai_workout_sessions WHERE user_id = ? AND date = ?",
         (user_id, today)
@@ -1268,13 +1447,13 @@ def create_today_session(user_id: int, plan_data: dict) -> Optional[dict]:
     existing = get_today_session(user_id)
     if existing:
         return existing
-    today_exercises = get_today_plan(plan_data)
+    today_exercises = get_today_plan(plan_data, user_id)
     if not today_exercises:
         return None
-    today = datetime.now().strftime("%Y-%m-%d")
-    weekday = datetime.now().weekday()
+    today = user_today_str(user_id)
+    weekday = user_weekday(user_id)
     start_date = plan_data.get("start_date") or today
-    week_key = get_current_week_session_key(plan_data, start_date)
+    week_key = get_current_week_session_key(plan_data, start_date, user_id)
     today_key = WEEKDAY_KEY[weekday]
     session_key = f"{week_key}_{today_key}"
     plan_json = json.dumps(today_exercises, ensure_ascii=False)
@@ -1760,11 +1939,11 @@ def update_session_exercise_plan(user_id: int, session_id: int,
                 update_plan_json(user_id, plan)
     db.commit()
 
-def get_next_training_day(plan_data: dict) -> Optional[str]:
+def get_next_training_day(plan_data: dict, user_id: Optional[int] = None) -> Optional[str]:
     """Возвращает дату и название следующей тренировки."""
     plan = plan_data["plan"]
     start_date = plan_data["start_date"]
-    today = datetime.now().date()
+    today = user_today_date(user_id) if user_id is not None else datetime.now().date()
     today_weekday = today.weekday()
 
     for offset in range(1, 8):
@@ -1785,7 +1964,7 @@ def get_weekly_workout_progress(user_id: int) -> tuple:
     plan_data = get_ai_plan(user_id)
     days_per_week = plan_data['days_per_week'] if plan_data else 0
     # Считаем начало недели (понедельник)
-    today = datetime.now().date()
+    today = user_today_date(user_id)
     week_start = today - timedelta(days=today.weekday())
     week_start_str = week_start.strftime('%Y-%m-%d')
     cursor = db.execute(
@@ -1835,13 +2014,16 @@ def init_db():
             notification_enabled INTEGER DEFAULT 1,
             streak_days INTEGER DEFAULT 0,
             last_active_date TEXT,
-            last_ai_answer TEXT DEFAULT NULL
+            last_ai_answer TEXT DEFAULT NULL,
+            timezone TEXT DEFAULT NULL
         )
     ''')
     cursor = db.execute("PRAGMA table_info(user_settings)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'last_ai_answer' not in columns:
         db.execute("ALTER TABLE user_settings ADD COLUMN last_ai_answer TEXT DEFAULT NULL")
+    if 'timezone' not in columns:
+        db.execute("ALTER TABLE user_settings ADD COLUMN timezone TEXT DEFAULT NULL")
     db.execute("UPDATE user_settings SET notification_enabled = 1 WHERE notification_enabled IS NULL")
     db.execute('''
         CREATE TABLE IF NOT EXISTS diet_profile (
@@ -2065,8 +2247,7 @@ def main_menu_keyboard():
 def reflection_keyboard():
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="😴 Сон"), KeyboardButton(text="🍽 Еда")],
-            [KeyboardButton(text="💪 Активность"), KeyboardButton(text="🎮 Зависание")],
+            [KeyboardButton(text="😴 Сон"), KeyboardButton(text="🎮 Зависание")],
             [KeyboardButton(text="🎯 Настрой")],
             [KeyboardButton(text="🔙 Назад")]
         ],
@@ -2330,9 +2511,8 @@ def food_cancel_keyboard():
 
 
 # ============ КЛАВИАТУРЫ ДЛЯ ЗАДАЧ ============
-def tasks_menu_keyboard(tasks: list) -> InlineKeyboardMarkup:
+def tasks_menu_keyboard(tasks: list, user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     buttons = []
-    today = datetime.now().date()
     for t in tasks:
         prefix = "🔥 " if t['is_priority'] else ""
         title = t['title']
@@ -2340,7 +2520,7 @@ def tasks_menu_keyboard(tasks: list) -> InlineKeyboardMarkup:
             title = title[:25] + "..."
         suffix = ""
         if t['deadline']:
-            suffix = f" ⏰{days_left_str(t['deadline'])}"
+            suffix = f" ⏰{days_left_str(t['deadline'], user_id)}"
         if t.get('repeat_days'):
             suffix += f" 🔁"
         label = f"{'✅ ' if t['is_done'] else ''}{prefix}{title}{suffix}"
@@ -2393,7 +2573,7 @@ def task_deadline_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="Пропустить", callback_data="task_deadline_no")]
     ])
 
-def urgent_tasks_keyboard(tasks: list) -> Optional[InlineKeyboardMarkup]:
+def urgent_tasks_keyboard(tasks: list, user_id: Optional[int] = None) -> Optional[InlineKeyboardMarkup]:
     """Инлайн-кнопки срочных задач для главного меню."""
     if not tasks:
         return None
@@ -2403,7 +2583,7 @@ def urgent_tasks_keyboard(tasks: list) -> Optional[InlineKeyboardMarkup]:
         if len(label) > 32:
             label = label[:29] + "..."
         if t.get('days_left') is not None:
-            label += f" – {days_left_str(t['deadline'])}"
+            label += f" – {days_left_str(t['deadline'], user_id)}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"task_done_{t['id']}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -2582,7 +2762,7 @@ async def send_main_menu(bot: Bot, user_id: int, chat_id: int):
         # Отправляем срочные задачи отдельным сообщением если есть
         urgent = get_urgent_tasks_for_menu(user_id)
         if urgent:
-            kb = urgent_tasks_keyboard(urgent)
+            kb = urgent_tasks_keyboard(urgent, user_id)
             tasks_msg = await bot.send_message(chat_id, "⚡ Срочные задачи:", reply_markup=kb)
             user_temp_messages.setdefault(user_id, {})['urgent_tasks'] = tasks_msg.message_id
         else:
@@ -2652,7 +2832,50 @@ async def handle_start_button(message: Message, bot: Bot):
         del user_welcome_message[user_id]
     save_user_settings(user_id, message.from_user.username, message.from_user.first_name)
     update_streak(user_id)
+    cursor = db.execute('SELECT timezone FROM user_settings WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        msg = await bot.send_message(
+            message.chat.id,
+            "🕒 Для начала выбери свой часовой пояс — так все даты, стрики и напоминания "
+            "будут работать по твоему времени, а не по серверному.\n\n"
+            "Позже его можно поменять командой /timezone.",
+            reply_markup=timezone_picker_keyboard("onboarding")
+        )
+        user_temp_messages.setdefault(user_id, {})['timezone_picker'] = msg.message_id
+        return
     await send_main_menu(bot, user_id, message.chat.id)
+
+@router.callback_query(F.data.startswith("tz:"))
+async def handle_timezone_choice(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    _, tz_name, context = callback.data.split(":")
+    set_user_timezone(user_id, tz_name)
+    temps = user_temp_messages.get(user_id, {})
+    await delete_message_safe(bot, callback.message.chat.id, temps.pop('timezone_picker', None))
+    user_temp_messages[user_id] = temps
+    label = next((l for l, tz in RUSSIAN_TIMEZONES if tz == tz_name), tz_name)
+    await callback.answer(f"Часовой пояс: {label} ✅")
+    if context == "onboarding":
+        await send_main_menu(bot, user_id, callback.message.chat.id)
+    else:
+        confirm_msg = await bot.send_message(callback.message.chat.id, f"🕒 Часовой пояс изменён на: {label}")
+        asyncio.create_task(delete_message_after_delay(bot, callback.message.chat.id, confirm_msg.message_id, delay=4))
+
+@router.message(Command("timezone"))
+async def cmd_timezone(message: Message, bot: Bot):
+    try:
+        await message.delete()
+    except:
+        pass
+    user_id = message.from_user.id
+    current = get_user_timezone(user_id)
+    current_label = next((label for label, tz in RUSSIAN_TIMEZONES if tz == current), current)
+    msg = await message.answer(
+        f"🕒 Текущий часовой пояс: {current_label}\n\nВыбери новый:",
+        reply_markup=timezone_picker_keyboard("change")
+    )
+    user_temp_messages.setdefault(user_id, {})['timezone_picker'] = msg.message_id
 
 # ---------- РЕФЛЕКСИЯ ----------
 async def show_reflection_menu(user_id: int, chat_id: int, bot: Bot, state: FSMContext, fallback_name: Optional[str] = None):
@@ -2671,6 +2894,18 @@ async def show_reflection_menu(user_id: int, chat_id: int, bot: Bot, state: FSMC
     else:
         temps.pop('all_categories_filled', None)
     user_temp_messages[user_id] = temps
+    # Еда и активность теперь считаются автоматически (после лога еды/тренировки, либо в
+    # конце дня) - если пользователь уже заполнил всё, что доступно ему вручную, незачем
+    # бесконечно звать его обратно в "что оценим?" в ожидании авто-категорий.
+    if manual_categories_completed(user_id):
+        await bot.send_message(
+            chat_id,
+            f"{name}, на сегодня с рефлексией всё! 🎉\n"
+            "Еда и активность посчитаются сами, как только ты их залогируешь.",
+        )
+        await delete_temp_messages(bot, user_id, chat_id, keep_ai=True)
+        await send_main_menu(bot, user_id, chat_id)
+        return
     msg = await bot.send_message(chat_id, f"{name}, что оценим?", reply_markup=reflection_keyboard())
     user_temp_messages[user_id]['reflection'] = msg.message_id
 
@@ -2683,7 +2918,7 @@ async def handle_reflection(message: Message, bot: Bot, state: FSMContext):
     await show_reflection_menu(message.from_user.id, message.chat.id, bot, state, message.from_user.first_name)
 
 
-@router.message(F.text.in_(["😴 Сон", "🍽 Еда", "💪 Активность", "🎮 Зависание", "🎯 Настрой"]))
+@router.message(F.text.in_(["😴 Сон", "🎮 Зависание"]))
 async def handle_category(message: Message, bot: Bot, state: FSMContext):
     try:
         await message.delete()
@@ -2691,10 +2926,7 @@ async def handle_category(message: Message, bot: Bot, state: FSMContext):
         pass
     text_to_category = {
         "😴 Сон": "сон",
-        "🍽 Еда": "еда",
-        "💪 Активность": "активность",
         "🎮 Зависание": "зависание",
-        "🎯 Настрой": "настрой"
     }
     category = text_to_category.get(message.text)
     if not category:
@@ -2707,6 +2939,97 @@ async def handle_category(message: Message, bot: Bot, state: FSMContext):
     temps['rating'] = msg.message_id
     # Сохраняем флаг all_categories_filled для последующей проверки в process_rating
     user_temp_messages[message.from_user.id] = temps
+
+@router.message(F.text == "🎯 Настрой")
+async def handle_mood_category(message: Message, bot: Bot, state: FSMContext):
+    try:
+        await message.delete()
+    except:
+        pass
+    user_id = message.from_user.id
+    temps = user_temp_messages.get(user_id, {})
+    await delete_message_safe(bot, message.chat.id, temps.get('reflection'))
+    await state.set_state(RatingState.waiting_for_mood_text)
+    msg = await message.answer(
+        "🎯 Опиши в паре предложений, как прошёл твой день и что ты сегодня чувствовал(а):",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Назад")]],
+                                          resize_keyboard=True)
+    )
+    temps['rating'] = msg.message_id
+    user_temp_messages[user_id] = temps
+
+@router.message(RatingState.waiting_for_mood_text)
+async def process_mood_text(message: Message, bot: Bot, state: FSMContext):
+    if message.text == "🔙 Назад":
+        try:
+            await message.delete()
+        except:
+            pass
+        await show_reflection_menu(message.from_user.id, message.chat.id, bot, state, message.from_user.first_name)
+        return
+    description = (message.text or "").strip()
+    if len(description) < 3:
+        await message.answer("Напиши чуть подробнее, как прошёл день 🙂")
+        return
+    user_id = message.from_user.id
+    try:
+        await message.delete()
+    except:
+        pass
+    temps = user_temp_messages.get(user_id, {})
+    await delete_message_safe(bot, message.chat.id, temps.get('rating'))
+    await bot.send_chat_action(message.chat.id, action=ChatAction.TYPING)
+    thinking_msg = await message.answer("Думаю...")
+    temps['rating'] = thinking_msg.message_id
+    user_temp_messages[user_id] = temps
+
+    name = get_user_name(user_id, message.from_user.first_name)
+    full_context = get_full_context_for_ai(user_id)
+    prompt = f"""Ты — заботливый персональный трекер-ассистент. Пользователя зовут {name}.
+Он(а) описал(а) свой сегодняшний день и настроение так: "{description}"
+
+Вот что ты ещё знаешь о нём(ней) за последнее время:
+{full_context}
+
+Оцени его(её) настроение сегодня по шкале от 1 до 10 (10 — отличное настроение, 1 — очень плохое).
+Затем напиши короткий (2-4 предложения) тёплый отклик по-русски, обращаясь по имени:
+- если настроение хорошее — искренне порадуйся вместе с ним(ней);
+- если настроение так себе или плохое — мягко поддержи и дай 1-2 конкретных совета,
+  как можно улучшить состояние или разобраться с тяжёлыми эмоциями, учитывая контекст выше.
+Ответь СТРОГО в формате JSON без пояснений и без markdown:
+{{"rating": <целое число 1-10>, "response": "<текст отклика>"}}"""
+
+    result = await run_in_thread(gemini_generate_rating, prompt)
+    if not result:
+        # ИИ для оценок недоступен - откатываемся на ручной выбор, чтобы не потерять запись
+        await delete_message_safe(bot, message.chat.id, temps.get('rating'))
+        await state.update_data(category='настрой')
+        await state.set_state(RatingState.waiting_for_rating)
+        msg = await message.answer("📝 Оцени НАСТРОЙ за сегодня:", reply_markup=rating_keyboard())
+        temps['rating'] = msg.message_id
+        user_temp_messages[user_id] = temps
+        return
+
+    today = user_today_str(user_id)
+    rating = result['rating']
+    save_rating(user_id, 'настрой', rating, today)
+    reply_text = f"🎯 Настрой: {rating}/10\n\n{result.get('response') or result.get('comment', '')}"
+    await state.clear()
+    await delete_message_safe(bot, message.chat.id, temps.get('rating'))
+
+    all_completed = check_all_categories_completed(user_id)
+    if all_completed:
+        success, sparks_today, rank_up, old_rank, new_rank = add_spark(user_id, 'categories')
+        update_streak(user_id)
+        await message.answer(reply_text)
+        await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
+        await send_main_menu(bot, user_id, message.chat.id)
+    else:
+        msg = await message.answer(reply_text, reply_markup=reflection_keyboard())
+        temps = user_temp_messages.get(user_id, {})
+        temps['rating'] = msg.message_id
+        user_temp_messages[user_id] = temps
+        await show_reflection_menu(user_id, message.chat.id, bot, state, message.from_user.first_name)
 
 @router.message(F.text == "🔙 Назад в меню")
 async def back_to_main_msg(message: Message, bot: Bot, state: FSMContext):
@@ -2777,7 +3100,7 @@ async def process_rating(callback: CallbackQuery, bot: Bot, state: FSMContext):
     data = await state.get_data()
     category = data.get("category")
     rating = int(callback.data.split(":")[1])
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(callback.from_user.id)
     save_rating(callback.from_user.id, category, rating, today)
     await state.clear()
     temps = user_temp_messages.get(callback.from_user.id, {})
@@ -3040,8 +3363,8 @@ async def show_workout_main_menu(user_id: int, chat_id: int, bot: Bot):
 
     done_week, plan_week = get_weekly_workout_progress(user_id)
     week_bar = create_workout_progress_bar(done_week, plan_week if plan_week else 1)
-    today_wd = WEEKDAY_RU[datetime.now().weekday()]
-    date_str = datetime.now().strftime('%d.%m.%Y')
+    today_wd = WEEKDAY_RU[user_weekday(user_id)]
+    date_str = user_today_str(user_id, '%d.%m.%Y')
 
     # Show today's completed exercises
     today_str = ""
@@ -3292,7 +3615,7 @@ async def save_workout_and_continue(message: Message, bot: Bot, state: FSMContex
     data = await state.get_data()
     ex_name = data['exercise_name']
     ex_type = data.get('ex_type', 'strength')
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
 
     if ex_type == 'strength':
         sets = data['sets']
@@ -3451,7 +3774,7 @@ async def workout_achieve_goal(callback: CallbackQuery, bot: Bot, state: FSMCont
         await callback.answer("❌ Упражнение не найдено", show_alert=True)
         return
     ex_name, cat_id, target_sets, target_reps, target_weight, inc, target_distance, target_duration, ex_type = row
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = user_today_str(user_id)
 
     # Проверяем ДО вставки для определения первой тренировки дня
     cursor = db.execute('SELECT COUNT(*) FROM workout_log WHERE user_id = ? AND date = ?', (user_id, today))
@@ -3513,7 +3836,7 @@ async def _show_ai_workout_today_inner(user_id: int, chat_id: int, bot: Bot, sta
     if not plan_data:
         return
 
-    today_exercises = get_today_plan(plan_data)
+    today_exercises = get_today_plan(plan_data, user_id)
     temps = user_temp_messages.get(user_id, {})
 
     if not today_exercises:
@@ -3521,7 +3844,7 @@ async def _show_ai_workout_today_inner(user_id: int, chat_id: int, bot: Bot, sta
         # Удаляем предыдущее сообщение workout_menu
         await delete_message_safe(bot, chat_id, temps.get('workout_menu'))
         
-        next_date, next_day = get_next_training_day(plan_data)
+        next_date, next_day = get_next_training_day(plan_data, user_id)
         text = "Сегодня день отдыха."
         if next_date and next_day:
             text += f"\nСледующая тренировка: {next_day}, {next_date}"
@@ -3538,7 +3861,7 @@ async def _show_ai_workout_today_inner(user_id: int, chat_id: int, bot: Bot, sta
         await delete_message_safe(bot, chat_id, temps.get('workout_menu'))
         
         text = "Сегодняшняя тренировка уже записана."
-        next_date, next_day = get_next_training_day(plan_data)
+        next_date, next_day = get_next_training_day(plan_data, user_id)
         if next_date:
             text += f"\nСледующая: {next_day}, {next_date}"
         msg = await bot.send_message(chat_id, text, reply_markup=ws_rest_day_keyboard())
@@ -3547,16 +3870,16 @@ async def _show_ai_workout_today_inner(user_id: int, chat_id: int, bot: Bot, sta
         return
 
     # Получаем историю прошлого раза
-    weekday = datetime.now().weekday()
+    weekday = user_weekday(user_id)
     today_key = WEEKDAY_KEY[weekday]
-    week_key = get_current_week_session_key(plan_data, plan_data["start_date"])
+    week_key = get_current_week_session_key(plan_data, plan_data["start_date"], user_id)
     session_key = f"{week_key}_{today_key}"
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = user_today_str(user_id)
     prev_sessions = get_previous_same_session(user_id, session_key, today_str)
 
     # Строим текст плана
     plan_name = f"Тренировка — {WEEKDAY_RU[weekday]}"
-    date_str = datetime.now().strftime("%d.%m.%Y")
+    date_str = user_today_str(user_id, '%d.%m.%Y')
     lines = [f"{plan_name}", f"{date_str}", ""]
     for i, ex in enumerate(today_exercises, 1):
         name = ex.get("exercise", ex.get("name", "?"))
@@ -4264,7 +4587,7 @@ async def _finish_workout(message, bot: Bot, state: FSMContext, user_id: int):
     data = await state.get_data()
     session_id = data.get("session_id")
     exercises = data.get("exercises", [])
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = user_today_str(user_id)
 
     # Помечаем сессию как выполненную
     db.execute("UPDATE ai_workout_sessions SET status='done', completed_at=? WHERE id=?",
@@ -4291,6 +4614,7 @@ async def _finish_workout(message, bot: Bot, state: FSMContext, user_id: int):
     add_workout(user_id)
     success, _, rank_up, _, new_rank = add_spark(user_id, "workout")
     update_streak(user_id)
+    asyncio.create_task(run_in_thread(sync_activity_rating_for_today, user_id))
 
     # Строим итоговое сообщение
     lines = ["Тренировка завершена\n"]
@@ -4302,7 +4626,7 @@ async def _finish_workout(message, bot: Bot, state: FSMContext, user_id: int):
     lines.append(f"\n{feedback}")
 
     plan_data = get_ai_plan(user_id)
-    next_date, next_day = get_next_training_day(plan_data) if plan_data else (None, None)
+    next_date, next_day = get_next_training_day(plan_data, user_id) if plan_data else (None, None)
     if next_date:
         lines.append(f"\nСледующая тренировка: {next_day}, {next_date}")
     if rank_up:
@@ -4379,7 +4703,7 @@ async def ws_skip_day_reason(message: Message, bot: Bot, state: FSMContext):
     msg_id = temps.get("workout_menu")
     text = "День пропущен."
     plan_data = get_ai_plan(user_id)
-    next_date, next_day = get_next_training_day(plan_data) if plan_data else (None, None)
+    next_date, next_day = get_next_training_day(plan_data, user_id) if plan_data else (None, None)
     if next_date:
         text += f"\nСледующая тренировка: {next_day}, {next_date}"
     if msg_id:
@@ -4477,7 +4801,7 @@ async def wp_monthly_review_input(message: Message, bot: Bot, state: FSMContext)
     if plan_data:
         new_plan = apply_monthly_changes(user_id, plan_data, indices, changes)
         update_plan_json(user_id, new_plan)
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = user_today_str(user_id)
         db.execute("UPDATE ai_workout_plan SET last_monthly_review=? WHERE user_id=?",
                    (today, user_id))
         db.commit()
@@ -5990,6 +6314,7 @@ async def food_confirm_yes(callback: CallbackQuery, bot: Bot, state: FSMContext)
     calories = data.get('food_calories')
     user_id = callback.from_user.id
     save_food_log(user_id, meal_type, description, calories)
+    asyncio.create_task(run_in_thread(sync_diet_rating_for_today, user_id))
 
     success_msg = await callback.message.answer(f"✅ Записано: {int(calories)} ккал.")
     await asyncio.sleep(2)
@@ -6051,6 +6376,7 @@ async def manual_calories(message: Message, bot: Bot, state: FSMContext):
     meal_type = data.get('meal_type')
     description = data.get('food_description', '')
     save_food_log(user_id, meal_type, description, calories)
+    asyncio.create_task(run_in_thread(sync_diet_rating_for_today, user_id))
 
     await state.update_data(manual_calories_value=calories)
     await state.set_state(DietState.new_food_name)
@@ -6647,7 +6973,7 @@ async def show_tasks_menu(user_id: int, chat_id: int, bot: Bot):
         text = "📝 Твои задачи:"
     else:
         text = "📝 Задач пока нет. Добавь первую!"
-    kb = tasks_menu_keyboard(tasks)
+    kb = tasks_menu_keyboard(tasks, user_id)
     msg = await bot.send_message(chat_id, text, reply_markup=kb)
     temps['tasks_menu'] = msg.message_id
     user_temp_messages[user_id] = temps
@@ -6709,7 +7035,7 @@ async def task_confirm(callback: CallbackQuery, bot: Bot, state: FSMContext):
             user_temp_messages[user_id] = temps
         else:
             # More tasks remain - edit the message with updated keyboard
-            kb = urgent_tasks_keyboard(urgent)
+            kb = urgent_tasks_keyboard(urgent, user_id)
             try:
                 await callback.message.edit_reply_markup(reply_markup=kb)
             except:
@@ -6839,7 +7165,7 @@ async def task_enter_deadline(message: Message, bot: Bot, state: FSMContext):
     text = message.text.strip()
     try:
         dl = datetime.strptime(text, '%d.%m.%Y')
-        if dl.date() < datetime.now().date():
+        if dl.date() < user_today_date(message.from_user.id):
             await message.answer("❌ Дата уже прошла. Введи будущую дату:")
             return
         deadline_str = dl.strftime('%Y-%m-%d')
@@ -7058,6 +7384,7 @@ def generate_weekly_report(user_id: int) -> str:
     return report
     
 async def main():
+    global scheduler
     print("[BOOT] Старт...")
     init_db()
     print("[BOOT] База инициализирована")
@@ -7069,6 +7396,16 @@ async def main():
     
     bot = Bot(token=BOT_TOKEN)
     print("[BOOT] Бот создан")
+
+    scheduler = AsyncIOScheduler()
+    for _, tz_name in RUSSIAN_TIMEZONES:
+        scheduler.add_job(
+            finalize_daily_ratings_for_timezone, 'cron',
+            hour=23, minute=55, timezone=ZoneInfo(tz_name),
+            args=[tz_name], id=f"finalize_ratings_{tz_name}", replace_existing=True
+        )
+    scheduler.start()
+    print("[BOOT] Планировщик запущен")
     
     await bot.delete_webhook(drop_pending_updates=True)
     print("[BOOT] Webhook удалён")
