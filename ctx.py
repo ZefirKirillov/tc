@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Tuple, List, Any
 from collections import defaultdict
 import io
+import json
 from aiogram import F
 from PIL import Image
 from aiogram.filters import StateFilter
@@ -560,6 +561,30 @@ def gemini_generate_rating(prompt: str, max_tokens: int = 1024) -> Optional[dict
         traceback.print_exc()
         return None
 
+def analyze_food_photo(image_bytes: bytes, prompt: str) -> Optional[str]:
+    """Распознавание блюда/калорий по фото. Возвращает None при ошибке,
+    чтобы вызывающий код мог показать кнопку повтора."""
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key or not image_bytes:
+        return None
+    try:
+        client = genai.Client(api_key=api_key)
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type='image/png')
+        response = client.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=[image_part, prompt],
+            config=types.GenerateContentConfig(max_output_tokens=256)
+        )
+        text = (getattr(response, 'text', None) or "").strip()
+        if not text and response.candidates and response.candidates[0].content.parts:
+            text = response.candidates[0].content.parts[0].text.strip()
+        return text or None
+    except Exception as e:
+        import traceback
+        print(f"[FOOD PHOTO] Ошибка: {e}")
+        traceback.print_exc()
+        return None
+
 def photo_analysis_cancel_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
@@ -628,6 +653,11 @@ async def analyze_photo(message: Message, bot: Bot, state: FSMContext):
 • Слабые стороны (1-2 предложения)
 • Рекомендации (2-3 конкретных совета)
 Без воды, по делу, макс 150 слов."""
+    await state.update_data(
+        retry_photo_bytes=image_bytes,
+        retry_photo_prompt=prompt,
+        retry_action="photo_analysis"
+    )
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         analysis = "❌ ИИ недоступен (нет API-ключа)."
@@ -635,7 +665,8 @@ async def analyze_photo(message: Message, bot: Bot, state: FSMContext):
         try:
             client = genai.Client(api_key=api_key)
             image_part = types.Part.from_bytes(data=image_bytes, mime_type='image/png')
-            response = client.models.generate_content(
+            response = await run_in_thread(
+                client.models.generate_content,
                 model='gemini-3.6-flash',
                 contents=[prompt, image_part],
                 config=types.GenerateContentConfig(max_output_tokens=2048)
@@ -648,6 +679,14 @@ async def analyze_photo(message: Message, bot: Bot, state: FSMContext):
             analysis = f"❌ Ошибка: {str(e)[:100]}"
 
     await delete_message_safe(bot, chat_id, status_msg.message_id)
+    if analysis.startswith("❌"):
+        result_msg = await message.answer(
+            analysis + "\n\n🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("photo_analysis")
+        )
+        user_temp_messages.setdefault(user_id, {})['photo_analysis_result'] = result_msg.message_id
+        await state.clear()
+        return
     result_msg = await message.answer(analysis, reply_markup=photo_analysis_back_keyboard())
     user_temp_messages.setdefault(user_id, {})['photo_analysis_result'] = result_msg.message_id
     await state.clear()
@@ -1674,11 +1713,11 @@ def format_exercise_card(exercise: dict, index: int, total: int, prev_result: di
     return text
 
 
-async def run_in_thread(func, *args):
+async def run_in_thread(func, *args, **kwargs):
     """Запускает синхронную функцию в пуле потоков, не блокируя event loop."""
     loop = asyncio.get_event_loop()
     import functools
-    return await loop.run_in_executor(None, functools.partial(func, *args))
+    return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
 def _parse_json_response(text: str) -> Optional[dict]:
     """Надёжно извлекает JSON из ответа Gemini."""
@@ -2392,6 +2431,423 @@ def low_rating_keyboard(category: str):
     ])
     return keyboard
 
+def retry_ai_keyboard(action: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data=f"retry_ai:{action}")]
+    ])
+
+@router.callback_query(F.data.startswith("retry_ai:"))
+async def retry_ai_action(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    if action == "mood":
+        await state.set_state(RatingState.waiting_for_mood_text)
+        await _retry_mood_rating(callback, bot, state)
+    elif action == "ai_advice":
+        await _retry_ai_advice(callback, bot, state)
+    elif action == "ai_question":
+        await _retry_ai_question(callback, bot, state)
+    elif action == "generate_plan":
+        await _retry_generate_plan(callback, bot, state)
+    elif action == "low_rating":
+        await _retry_low_rating(callback, bot, state)
+    elif action == "food_calories":
+        await _retry_food_calories(callback, bot, state)
+    elif action == "food_photo":
+        await _retry_food_photo(callback, bot, state)
+    elif action == "photo_analysis":
+        await _retry_photo_analysis(callback, bot, state)
+    elif action == "manual_plan":
+        await _retry_manual_plan(callback, bot, state)
+    elif action == "monthly_review":
+        await _retry_monthly_review(callback, bot, state)
+    elif action == "session_feedback":
+        await _retry_session_feedback(callback, bot, state)
+    await callback.answer()
+
+async def _retry_mood_rating(callback, bot, state):
+    data = await state.get_data()
+    description = data.get("retry_mood_description", "")
+    user_id = callback.from_user.id
+    name = get_user_name(user_id, callback.from_user.first_name)
+    full_context = get_full_context_for_ai(user_id)
+    prompt = f"""Ты — заботливый персональный трекер-ассистент. Пользователя зовут {name}.
+Он(а) описал(а) свой сегодняшний день и настроение так: "{description}"
+
+Вот что ты ещё знаешь о нём(ней) за последнее время:
+{full_context}
+
+Оцени его(её) настроение сегодня по шкале от 1 до 10 (10 — отличное настроение, 1 — очень плохое).
+Затем напиши короткий (2-4 предложения) тёплый отклик по-русски, обращаясь по имени:
+- если настроение хорошее — искренне порадуйся вместе с ним(ней);
+- если настроение так себе или плохое — мягко поддержи и дай 1-2 конкретных совета,
+  как можно улучшить состояние или разобраться с тяжёлыми эмоциями, учитывая контекст выше.
+Ответь СТРОГО в формате JSON без пояснений и без markdown:
+{{"rating": <целое число 1-10>, "response": "<текст отклика>"}}"""
+    result = await run_in_thread(gemini_generate_rating, prompt)
+    if not result:
+        await callback.message.edit_text(
+            "❌ ИИ не ответил. Попробуй ещё раз.",
+            reply_markup=retry_ai_keyboard("mood")
+        )
+        return
+    today = user_today_str(user_id)
+    rating = result['rating']
+    save_rating(user_id, 'настрой', rating, today)
+    reply_text = f"🎯 Настрой: {rating}/10\n\n{result.get('response') or result.get('comment', '')}"
+    await callback.message.edit_text(reply_text, reply_markup=reflection_keyboard())
+    await state.clear()
+    all_completed = check_all_categories_completed(user_id)
+    if all_completed:
+        success, sparks_today, rank_up, old_rank, new_rank = add_spark(user_id, 'categories')
+        update_streak(user_id)
+        await send_main_menu(bot, callback.from_user.id, callback.message.chat.id)
+    else:
+        await show_reflection_menu(user_id, callback.message.chat.id, bot, state, callback.from_user.first_name)
+
+async def _retry_ai_advice(callback, bot, state):
+    data = await state.get_data()
+    user_id = callback.from_user.id
+    name = get_user_name(user_id, callback.from_user.first_name)
+    full_context = get_full_context_for_ai(user_id)
+    prompt = data.get("retry_ai_prompt", "")
+    try:
+        answer = await run_in_thread(gemini_generate, prompt, 8192)
+    except:
+        answer = "❌ Ошибка ИИ."
+    if answer.startswith("❌"):
+        await callback.message.edit_text(
+            f"❌ ИИ не ответил. Попробуй ещё раз.",
+            reply_markup=retry_ai_keyboard("ai_advice")
+        )
+        return
+    await callback.message.edit_text(
+        f"💡 <b>Совет:</b>\n\n{answer}",
+        parse_mode="HTML", reply_markup=ai_reply_keyboard()
+    )
+    save_last_ai_answer(user_id, answer)
+
+async def _retry_ai_question(callback, bot, state):
+    data = await state.get_data()
+    user_id = callback.from_user.id
+    name = get_user_name(user_id, callback.from_user.first_name)
+    full_context = get_full_context_for_ai(user_id)
+    question = data.get("retry_ai_question", "")
+    prompt = f"""Ты — персональный трекер-ассистент. Пользователь {name}.
+
+Вот свежие данные пользователя:
+{full_context}
+
+Вопрос: {question}
+Ответь кратко, конкретно, с эмодзи, обращайся по имени."""
+    try:
+        answer = await run_in_thread(gemini_generate, prompt, 8192)
+    except:
+        answer = "❌ Ошибка ИИ."
+    if answer.startswith("❌"):
+        await callback.message.edit_text(
+            f"❌ ИИ не ответил. Попробуй ещё раз.",
+            reply_markup=retry_ai_keyboard("ai_question")
+        )
+        return
+    await callback.message.edit_text(
+        f"🤖 <b>Check AI:</b>\n\n{answer}",
+        parse_mode="HTML", reply_markup=ai_reply_keyboard()
+    )
+    save_last_ai_answer(user_id, answer)
+
+async def _retry_generate_plan(callback, bot, state):
+    data = await state.get_data()
+    user_id = callback.from_user.id
+    goal = data.get("wp_goal", "Общая форма")
+    level = data.get("wp_level", "Средний")
+    days = data.get("wp_days", 3)
+    notes = data.get("wp_notes", "")
+    await state.set_state(AIPlanState.reviewing_plan)
+    phrases = ["Анализирую...", "Ищу пишущую ручку...", "Составляю программу...",
+               "Подбираю упражнения...", "Рассчитываю нагрузку...", "Финальные штрихи..."]
+    temps = user_temp_messages.get(user_id, {})
+    msg_id = temps.get("workout_menu")
+    stop_animation = asyncio.Event()
+    async def animate():
+        i = 0
+        while not stop_animation.is_set():
+            try:
+                await bot.edit_message_text(phrases[i % len(phrases)],
+                                             callback.message.chat.id, msg_id)
+            except:
+                pass
+            await asyncio.sleep(2)
+            i += 1
+    anim_task = asyncio.create_task(animate())
+    try:
+        plan = await run_in_thread(gemini_generate_plan, goal, level, days, notes)
+    finally:
+        stop_animation.set()
+        anim_task.cancel()
+        try:
+            await anim_task
+        except asyncio.CancelledError:
+            pass
+    if not plan:
+        await callback.message.edit_text(
+            "Не удалось сгенерировать план. Попробуй ещё раз.",
+            reply_markup=retry_ai_keyboard("generate_plan")
+        )
+        return
+    await state.update_data(wp_plan=plan)
+    text = _format_full_plan(plan, goal, level, days)
+    await callback.message.edit_text(text, reply_markup=wp_plan_review_keyboard())
+
+async def _retry_low_rating(callback, bot, state):
+    data = await state.get_data()
+    category = data.get("retry_low_rating_category", "")
+    rating = data.get("retry_low_rating_value", 0)
+    user_id = callback.from_user.id
+    await bot.send_chat_action(callback.message.chat.id, action=ChatAction.TYPING)
+    analysis = await run_in_thread(analyze_low_rating, user_id, category, rating)
+    if analysis.startswith("❌"):
+        # ИИ снова не ответил — оставляем ту же кнопку повтора
+        await callback.message.edit_text(
+            "❌ ИИ не ответил. Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("low_rating")
+        )
+        return
+    msg = await callback.message.answer(f"🤖 {analysis}", reply_markup=ai_reply_keyboard())
+    save_last_ai_answer(user_id, analysis)
+
+async def _retry_food_calories(callback, bot, state):
+    data = await state.get_data()
+    description = data.get("retry_food_description", "")
+    user_id = callback.from_user.id
+    prompt = f"""Ты — точный счётчик калорий. Пользователь описывает что он съел (на русском или английском языке).
+
+Твоя задача: посчитать ОБЩЕЕ количество ккал во всём описанном количестве еды.
+
+ПРАВИЛА:
+- Если указано количество (2 бургера, 3 яйца, 200г) — умножай соответственно
+- Если количество не указано — считай стандартную порцию (тарелка супа ~300мл, второе блюдо ~300-400г, бутерброд ~150г)
+- Учитывай ВСЕ компоненты: хлеб, масло, соусы, напитки, гарнир
+- Не занижай: реальная еда жирнее и калорийнее чем кажется
+- Минимум для полноценного приёма пищи (обед/ужин): 350 ккал
+- Перекус может быть 100-300 ккал
+
+Ориентиры (на порцию):
+гречка с курицей = 450, паста карбонара = 680, бургер = 550, пицца (2 куска) = 600,
+борщ = 300, салат цезарь с курицей = 520, омлет 2 яйца = 200, овсянка на молоке = 280,
+рис с мясом = 500, шаурма = 650, хинкали 5шт = 400, суши-сет 8шт = 480,
+протеиновый коктейль = 150, кофе с молоком = 60, яблоко = 80, банан = 100
+
+Еда: {description}
+
+Ответь СТРОГО одним целым числом — суммарные килокалории. Никаких слов, никаких единиц:"""
+    await bot.send_chat_action(callback.message.chat.id, action=ChatAction.TYPING)
+    response = await run_in_thread(gemini_generate, prompt, 100, True)
+    try:
+        numbers = re.findall(r"\b(\d{2,5})\b", response)
+        numbers = [float(n) for n in numbers if 50 <= float(n) <= 9999]
+        calories = numbers[-1] if numbers else None
+    except:
+        calories = None
+    if calories is None or calories <= 0:
+        # ИИ снова не смог — оставляем кнопку повтора, не заставляя вводить руками
+        await callback.message.edit_text(
+            f"❌ Не удалось определить калории для «{description}». "
+            "Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("food_calories")
+        )
+        return
+    await state.update_data(food_description=description, food_calories=calories)
+    await state.set_state(DietState.food_confirm)
+    await callback.message.edit_text(
+        f"🍽 Ты съел: {description}\n🔢 Калории: {int(calories)} ккал\n\nВсё верно?",
+        reply_markup=diet_confirm_food_keyboard()
+    )
+
+async def _retry_photo_analysis(callback, bot, state):
+    data = await state.get_data()
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    image_bytes = data.get("retry_photo_bytes")
+    prompt = data.get("retry_photo_prompt", """Кратко проанализируй телосложение на фото. Формат ответа:
+• Сильные стороны (1-2 предложения)
+• Слабые стороны (1-2 предложения)
+• Рекомендации (2-3 конкретных совета)
+Без воды, по делу, макс 150 слов.""")
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type='image/png')
+    try:
+        client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"))
+        response = await run_in_thread(
+            client.models.generate_content,
+            model='gemini-3.6-flash',
+            contents=[prompt, image_part],
+            config=types.GenerateContentConfig(max_output_tokens=2048)
+        )
+        text = getattr(response, 'text', None)
+        analysis = text.strip() if text else (response.candidates[0].content.parts[0].text if response.candidates and response.candidates[0].content.parts else "❌ Нет ответа")
+    except Exception as e:
+        analysis = f"❌ Ошибка: {str(e)[:100]}"
+    if analysis.startswith("❌"):
+        await callback.message.edit_text(
+            analysis + "\n\n🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("photo_analysis")
+        )
+        return
+    await callback.message.edit_text(analysis, reply_markup=photo_analysis_back_keyboard())
+    temps = user_temp_messages.get(user_id, {})
+    temps['photo_analysis_result'] = callback.message.message_id
+    user_temp_messages[user_id] = temps
+    await state.clear()
+
+async def _retry_food_photo(callback, bot, state):
+    """Повторный анализ того же фото блюда без повторной загрузки."""
+    data = await state.get_data()
+    user_id = callback.from_user.id
+    image_bytes = data.get("retry_food_photo_bytes")
+    prompt = data.get("retry_food_photo_prompt")
+    if not image_bytes or not prompt:
+        await callback.message.edit_text(
+            "❌ Фото больше не доступно. Отправь его заново."
+        )
+        return
+    await bot.send_chat_action(callback.message.chat.id, action=ChatAction.TYPING)
+    text = await run_in_thread(analyze_food_photo, image_bytes, prompt)
+    if text is None:
+        await callback.message.edit_text(
+            "❌ Ошибка анализа фото.\n\n🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("food_photo")
+        )
+        return
+    description = "Блюдо на фото"
+    calories = None
+    nums = re.findall(r"\b(\d{2,5})\b", text)
+    valid_nums = [float(n) for n in nums if 50 <= float(n) <= 9999]
+    if valid_nums:
+        calories = valid_nums[-1]
+    match = re.search(r"^([^0-9]+?)(?:\s*\d|$)", text)
+    if match:
+        desc = match.group(1).strip(" .,;:-")
+        if 2 <= len(desc) <= 50:
+            description = desc
+    if calories is None or calories <= 0 or calories > 5000:
+        await callback.message.edit_text(
+            f"🍽 Определено: {description}\n"
+            "❌ Не удалось оценить калории.\n\n"
+            "🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("food_photo")
+        )
+        return
+    await state.update_data(food_description=description, food_calories=calories)
+    await state.set_state(DietState.food_confirm)
+    await callback.message.edit_text(
+        f"🍽 Ты съел: {description}\n🔢 Калории: ~{int(calories)} ккал\n\nВсё верно?",
+        reply_markup=diet_confirm_food_keyboard()
+    )
+
+async def _retry_manual_plan(callback, bot, state):
+    """Повторный разбор того же текста плана без повторного ввода."""
+    data = await state.get_data()
+    user_id = callback.from_user.id
+    raw_text = data.get("retry_manual_plan_text", "")
+    if not raw_text:
+        await callback.message.edit_text(
+            "❌ Текст плана не сохранился. Введи его заново.",
+            reply_markup=wp_edit_keyboard()
+        )
+        return
+    await state.set_state(AIPlanState.reviewing_plan)
+    temps = user_temp_messages.get(user_id, {})
+    # Кнопка повтора живёт на сообщении об ошибке — его и редактируем
+    msg_id = callback.message.message_id
+    temps['workout_menu'] = msg_id
+    user_temp_messages[user_id] = temps
+    stop_anim = asyncio.Event()
+    phrases_m = ["Читаю план...", "Разбираю структуру...", "Определяю дни...",
+                 "Считаю подходы...", "Почти готово..."]
+
+    async def animate_m():
+        i = 0
+        while not stop_anim.is_set():
+            try:
+                await bot.edit_message_text(phrases_m[i % len(phrases_m)],
+                                            callback.message.chat.id, msg_id)
+            except:
+                pass
+            await asyncio.sleep(2)
+            i += 1
+    anim_m = asyncio.create_task(animate_m())
+    try:
+        plan = await run_in_thread(gemini_parse_manual_plan, raw_text)
+    finally:
+        stop_anim.set()
+        anim_m.cancel()
+        try:
+            await anim_m
+        except asyncio.CancelledError:
+            pass
+    if not plan:
+        plan = await run_in_thread(_fallback_parse_plan, raw_text)
+    if not plan:
+        # Возвращаемся в режим ввода — можно и нажать повторно, и переописать план
+        await state.set_state(AIPlanState.entering_manual_plan)
+        await callback.message.edit_text(
+            "❌ Не смог разобрать план.\n\n🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("manual_plan")
+        )
+        return
+    await state.update_data(wp_plan=plan, wp_mode="manual",
+                            wp_goal="", wp_level="", wp_days=0)
+    text = _format_full_plan(plan, "", "", 0)
+    try:
+        await bot.edit_message_text(text, callback.message.chat.id, msg_id,
+                                    reply_markup=wp_plan_review_keyboard_manual())
+    except:
+        new_msg = await callback.message.answer(text,
+                                                reply_markup=wp_plan_review_keyboard_manual())
+        temps['workout_menu'] = new_msg.message_id
+        user_temp_messages[user_id] = temps
+
+async def _retry_monthly_review(callback, bot, state):
+    """Повторный запуск месячного пересмотра упражнений."""
+    user_id = callback.from_user.id
+    plan_data = get_ai_plan(user_id)
+    if not plan_data:
+        await callback.answer("Нет плана", show_alert=True)
+        return
+    await bot.send_chat_action(callback.message.chat.id, action=ChatAction.TYPING)
+    await callback.message.edit_text("Анализирую прогресс...")
+    cursor = db.execute("""
+        SELECT date, plan_json, status FROM ai_workout_sessions
+        WHERE user_id = ? ORDER BY date DESC LIMIT 20
+    """, (user_id,))
+    recent = [{"date": row[0], "status": row[2]} for row in cursor.fetchall()]
+    changes = await run_in_thread(gemini_monthly_review, plan_data["plan"], recent)
+    if not changes:
+        await callback.message.edit_text(
+            "❌ Не удалось проанализировать прогресс.\n\n"
+            "🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("monthly_review")
+        )
+        return
+    if changes.get("no_changes_needed") or not changes.get("changes"):
+        await callback.message.edit_text(
+            "Менять ничего не нужно — план хорошо сбалансирован.",
+            reply_markup=wp_settings_keyboard()
+        )
+        return
+    chg = changes["changes"]
+    await state.set_state(WorkoutSessionState.monthly_review)
+    await state.update_data(review_changes=chg)
+    lines = ["Предлагаю заменить упражнения:\n"]
+    for i, ch in enumerate(chg, 1):
+        lines.append(f"{i}. {ch['old_exercise']} → {ch['new_exercise']}\n   {ch['reason']}")
+    lines.append("\nНапиши номера изменений которые принять (например: 1 3) или «нет» чтобы отклонить всё:")
+    await callback.message.edit_text("\n".join(lines),
+                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                          [InlineKeyboardButton(text="🔙 Назад",
+                                                                 callback_data="wp_review_decline")]
+                                      ]))
+
 def workout_main_reply_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -2912,13 +3368,11 @@ async def cmd_start(message: Message, bot: Bot):
 📊 *Статистика* – графики и динамика.
 🤳 *Анализ фото* – в разделе Тренировки, разбор сильных и слабых сторон телосложения.
 
-👇 Нажми **«ПОГНАЛИ!!!»**, чтобы начать!
+👇 Нажми кнопку **«ПОГНАЛИ 💪»**, чтобы начать!
         """
-        markup = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="ПОГНАЛИ!!!")]],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="ПОГНАЛИ 💪", callback_data="ws_start")]
+        ])
         msg = await bot.send_message(message.chat.id, welcome_text, parse_mode="Markdown", reply_markup=markup)
         user_welcome_message[user_id] = msg.message_id
         asyncio.create_task(delete_welcome_after_delay(user_id, bot, msg.message_id))
@@ -2933,23 +3387,34 @@ async def delete_welcome_after_delay(user_id: int, bot: Bot, msg_id: int):
     if user_id in user_welcome_message:
         del user_welcome_message[user_id]
 
-@router.message(F.text == "ПОГНАЛИ!!!")
-async def handle_start_button(message: Message, bot: Bot):
+@router.callback_query(F.data == "ws_start")
+async def handle_start_button(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    # Одна кнопка «ПОГНАЛИ» работает и на приветственном экране (онбординг),
+    # и на экране плана тренировки (просмотр плана → старт сессии).
+    current_state = await state.get_state()
+    if current_state == WorkoutSessionState.viewing_plan:
+        await _ws_start_workout(callback, bot, state)
+    else:
+        await _start_onboarding(callback, bot, state)
+    await callback.answer()
+
+async def _start_onboarding(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = callback.from_user.id
+    await state.clear()
+    # удаляем приветственное сообщение с кнопкой ПОГНАЛИ
     try:
-        await message.delete()
+        await callback.message.delete()
     except:
         pass
-    user_id = message.from_user.id
     if user_id in user_welcome_message:
-        await delete_message_safe(bot, user_id, user_welcome_message[user_id])
         del user_welcome_message[user_id]
-    save_user_settings(user_id, message.from_user.username, message.from_user.first_name)
+    save_user_settings(user_id, callback.from_user.username, callback.from_user.first_name)
     update_streak(user_id)
     cursor = db.execute('SELECT timezone FROM user_settings WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     if not row or not row[0]:
         msg = await bot.send_message(
-            message.chat.id,
+            callback.message.chat.id,
             "🕒 Для начала выбери свой часовой пояс — так все даты, стрики и напоминания "
             "будут работать по твоему времени, а не по серверному.\n\n"
             "Позже его можно поменять командой /timezone.",
@@ -2957,7 +3422,7 @@ async def handle_start_button(message: Message, bot: Bot):
         )
         user_temp_messages.setdefault(user_id, {})['timezone_picker'] = msg.message_id
         return
-    await send_main_menu(bot, user_id, message.chat.id)
+    await send_main_menu(bot, user_id, callback.message.chat.id)
 
 @router.callback_query(F.data.startswith("tz:"))
 async def handle_timezone_choice(callback: CallbackQuery, bot: Bot):
@@ -3113,15 +3578,17 @@ async def process_mood_text(message: Message, bot: Bot, state: FSMContext):
 Ответь СТРОГО в формате JSON без пояснений и без markdown:
 {{"rating": <целое число 1-10>, "response": "<текст отклика>"}}"""
 
+    await state.update_data(
+        retry_mood_description=description,
+        retry_action="mood"
+    )
     result = await run_in_thread(gemini_generate_rating, prompt)
     if not result:
-        # ИИ для оценок недоступен - откатываемся на ручной выбор, чтобы не потерять запись
         await delete_message_safe(bot, message.chat.id, temps.get('rating'))
-        await state.update_data(category='настрой')
-        await state.set_state(RatingState.waiting_for_rating)
-        msg = await message.answer("📝 Оцени НАСТРОЙ за сегодня:", reply_markup=rating_keyboard())
-        temps['rating'] = msg.message_id
-        user_temp_messages[user_id] = temps
+        await message.answer(
+            "❌ ИИ не ответил.",
+            reply_markup=retry_ai_keyboard("mood")
+        )
         return
 
     today = user_today_str(user_id)
@@ -3263,17 +3730,31 @@ async def process_rating(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.answer("✅ Сохранено!")
 
 @router.callback_query(F.data.startswith("analyze_low:"))
-async def analyze_low_rating_handler(callback: CallbackQuery, bot: Bot):
+async def analyze_low_rating_handler(callback: CallbackQuery, bot: Bot, state: FSMContext):
     category = callback.data.split(":")[1]
     today_ratings = get_today_ratings(callback.from_user.id)
     rating = today_ratings.get(category, 0)
     temps = user_temp_messages.get(callback.from_user.id, {})
     await delete_message_safe(bot, callback.message.chat.id, temps.get('low_rating'))
-    # Сохраняем флаг all_categories_filled для последующей проверки
     all_filled_flag = temps.get('all_categories_filled', False)
     await bot.send_chat_action(callback.message.chat.id, action=ChatAction.TYPING)
     await asyncio.sleep(1)
     analysis = analyze_low_rating(callback.from_user.id, category, rating)
+    if analysis.startswith("❌"):
+        await state.update_data(
+            retry_low_rating_category=category,
+            retry_low_rating_value=rating,
+            retry_action="low_rating"
+        )
+        await callback.message.answer(
+            "❌ ИИ не ответил.",
+            reply_markup=retry_ai_keyboard("low_rating")
+        )
+        if all_filled_flag:
+            temps['all_categories_filled'] = True
+        user_temp_messages[callback.from_user.id] = temps
+        await callback.answer()
+        return
     msg = await callback.message.answer(f"🤖 {analysis}", reply_markup=ai_reply_keyboard())
     temps['ai_response'] = msg.message_id
     if all_filled_flag:
@@ -3348,6 +3829,7 @@ async def handle_ai_advice(message: Message, bot: Bot, state: FSMContext):
 
 Дай короткий персональный совет (3-5 предложений): что идёт хорошо, на что обратить внимание, и один конкретный шаг на сегодня/завтра.
 Обращайся по имени, используй эмодзи, пиши по-русски."""
+    await state.update_data(retry_ai_prompt=prompt, retry_action="ai_advice")
     # Animation while generating
     phrases_ai = ["Думаю.", "Думаю..", "Думаю...", "Анализирую.", "Анализирую..", "Анализирую..."]
     stop_ai = asyncio.Event()
@@ -3376,6 +3858,17 @@ async def handle_ai_advice(message: Message, bot: Bot, state: FSMContext):
             await anim
         except asyncio.CancelledError:
             pass
+    if answer.startswith("❌"):
+        try:
+            await bot.edit_message_text("❌ ИИ не ответил.", message.chat.id, ai_msg_id)
+        except:
+            pass
+        await message.answer(
+            "❌ ИИ не ответил. Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("ai_advice")
+        )
+        await state.set_state(AIAdvisorState.waiting_for_question)
+        return
     try:
         await bot.edit_message_text(
             f"💡 <b>Совет:</b>\n\n{answer}",
@@ -3405,6 +3898,7 @@ async def process_ai_question(message: Message, bot: Bot, state: FSMContext):
     await bot.send_chat_action(message.chat.id, action=ChatAction.TYPING)
     name = get_user_name(user_id, message.from_user.first_name)
     full_context = get_full_context_for_ai(user_id)
+    await state.update_data(retry_ai_question=question, retry_action="ai_question")
     context = f"""Ты — персональный трекер-ассистент. Пользователь {name}.
 
 Вот свежие данные пользователя:
@@ -3441,6 +3935,17 @@ async def process_ai_question(message: Message, bot: Bot, state: FSMContext):
             await anim
         except asyncio.CancelledError:
             pass
+    if answer.startswith("❌"):
+        try:
+            await bot.edit_message_text("❌ ИИ не ответил.", message.chat.id, ai_msg_id)
+        except:
+            pass
+        await message.answer(
+            "❌ ИИ не ответил. Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("ai_question")
+        )
+        await state.set_state(AIAdvisorState.waiting_for_question)
+        return
     # Ответ ИИ с reply кнопкой - редактируем то же сообщение (не отправляем новое)
     try:
         await bot.edit_message_text(
@@ -4207,12 +4712,12 @@ async def _generate_and_show_plan(callback, bot: Bot, state: FSMContext):
             await bot.edit_message_text(
                 "Не удалось сгенерировать план. Попробуй ещё раз.",
                 callback.message.chat.id, msg_id,
-                reply_markup=wp_days_keyboard()
+                reply_markup=retry_ai_keyboard("generate_plan")
             )
         except:
             pass
         return
-    await state.update_data(wp_plan=plan)
+    await state.update_data(wp_plan=plan, retry_action="generate_plan")
     text = _format_full_plan(plan, goal, level, days)
     try:
         await bot.edit_message_text(text, callback.message.chat.id, msg_id,
@@ -4221,19 +4726,6 @@ async def _generate_and_show_plan(callback, bot: Bot, state: FSMContext):
         msg = await bot.send_message(callback.message.chat.id, text,
                                       reply_markup=wp_plan_review_keyboard())
         user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
-
-    # dummy placeholder to keep indentation
-    pass
-
-    if not plan:
-        await callback.message.edit_text(
-            "Не удалось сгенерировать план. Попробуй ещё раз.",
-            reply_markup=wp_days_keyboard()
-        )
-        return
-    await state.update_data(wp_plan=plan)
-    text = _format_full_plan(plan, goal, level, days)
-    await callback.message.edit_text(text, reply_markup=wp_plan_review_keyboard())
 
 @router.callback_query(F.data == "wp_back_to_days")
 async def wp_back_to_days(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -4414,11 +4906,14 @@ async def wp_plan_accept(callback: CallbackQuery, bot: Bot, state: FSMContext):
 @router.message(AIPlanState.entering_manual_plan)
 async def wp_manual_input(message: Message, bot: Bot, state: FSMContext):
     user_id = message.from_user.id
-    print(f"[MANUAL INPUT] User {user_id} sent plan: {repr(message.text[:200])}")
+    raw_text = message.text.strip()
+    print(f"[MANUAL INPUT] User {user_id} sent plan: {repr(raw_text[:200])}")
     try:
         await message.delete()
     except:
         pass
+    # Сохраняем текст для повтора по кнопке
+    await state.update_data(retry_manual_plan_text=raw_text, retry_action="manual_plan")
     temps = user_temp_messages.get(user_id, {})
     msg_id = temps.get("workout_menu")
     print(f"[MANUAL INPUT] msg_id={msg_id}")
@@ -4437,7 +4932,7 @@ async def wp_manual_input(message: Message, bot: Bot, state: FSMContext):
             i += 1
     anim_m = asyncio.create_task(animate_m())
     try:
-        plan = await run_in_thread(gemini_parse_manual_plan, message.text.strip())
+        plan = await run_in_thread(gemini_parse_manual_plan, raw_text)
     finally:
         stop_anim.set()
         anim_m.cancel()
@@ -4451,7 +4946,7 @@ async def wp_manual_input(message: Message, bot: Bot, state: FSMContext):
     if not plan:
         print(f"[MANUAL INPUT] Trying fallback parser...")
         # Always try to generate something - ask ИИ to do best effort
-        plan = await run_in_thread(_fallback_parse_plan, message.text.strip())
+        plan = await run_in_thread(_fallback_parse_plan, raw_text)
         print(f"[MANUAL INPUT] Fallback result: {'OK' if plan else 'FAILED'}")
     
     if not plan:
@@ -4461,8 +4956,10 @@ async def wp_manual_input(message: Message, bot: Bot, state: FSMContext):
             await delete_message_safe(bot, message.chat.id, msg_id)
         try:
             err_msg = await message.answer(
-                "❌ Не смог разобрать план. Попробуй ещё раз — можно скинуть тот же текст.",
+                "❌ Не смог разобрать план. Можно скинуть тот же текст — я попробую снова.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Попробовать снова",
+                                          callback_data="retry_ai:manual_plan")],
                     [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
                 ])
             )
@@ -4521,15 +5018,17 @@ async def back_to_workout_main_callback(callback: CallbackQuery, bot: Bot, state
     await show_workout_main_menu(user_id, callback.message.chat.id, bot)
     await callback.answer()
 
-@router.callback_query(WorkoutSessionState.viewing_plan, F.data == "ws_start")
-async def ws_start_workout(callback: CallbackQuery, bot: Bot, state: FSMContext):
+async def _ws_start_workout(callback: CallbackQuery, bot: Bot, state: FSMContext):
     user_id = callback.from_user.id
     data = await state.get_data()
     session_id = data.get("session_id")
     plan_data = get_ai_plan(user_id)
     session = get_today_session(user_id)
     if not session:
-        await callback.answer("Сессия не найдена", show_alert=True)
+        try:
+            await callback.answer("Сессия не найдена", show_alert=True)
+        except:
+            pass
         return
     exercises = session["plan"]
     if isinstance(exercises, dict):
@@ -4538,7 +5037,6 @@ async def ws_start_workout(callback: CallbackQuery, bot: Bot, state: FSMContext)
                             session_id=session["id"])
     await state.set_state(WorkoutSessionState.in_exercise)
     await _show_exercise(callback.message, bot, state, user_id, 0, exercises)
-    await callback.answer()
 
 async def _show_exercise(message, bot: Bot, state: FSMContext,
                           user_id: int, index: int, exercises: list):
@@ -4737,7 +5235,12 @@ async def _finish_workout(message, bot: Bot, state: FSMContext, user_id: int):
             lines.append(f"⏭ {log['exercise_name']} — пропущено")
         elif log.get("result") and log["result"].get("note"):
             lines.append(f"⚠️ {log['exercise_name']} — {log['result']['note']}")
-    lines.append(f"\n{feedback}")
+
+    feedback_failed = feedback.startswith("❌")
+    if feedback_failed:
+        lines.append("\n❌ ИИ не смог подготовить фидбек.")
+    else:
+        lines.append(f"\n{feedback}")
 
     plan_data = get_ai_plan(user_id)
     next_date, next_day = get_next_training_day(plan_data, user_id) if plan_data else (None, None)
@@ -4747,19 +5250,62 @@ async def _finish_workout(message, bot: Bot, state: FSMContext, user_id: int):
         lines.append(f"\n✨ Новый ранг: {get_rank_name(new_rank)}!")
 
     text = "\n".join(lines)
+    # Кнопка повтора фидбека (без ретипинга) — данные сессии уже сохранены
+    finish_kb = retry_ai_keyboard("session_feedback") if feedback_failed else ws_rest_day_keyboard()
     await state.clear()
+    # Сохраняем после clear() — данные нужны для повтора фидбека
+    await state.update_data(retry_session_id=session_id,
+                            retry_session_exercises=exercises)
     temps = user_temp_messages.get(user_id, {})
     msg_id = temps.get("workout_menu")
     if msg_id:
         try:
             await bot.edit_message_text(text, message.chat.id, msg_id,
-                                         reply_markup=ws_rest_day_keyboard())
+                                         reply_markup=finish_kb)
             return
         except:
             pass
-    msg = await message.answer(text, reply_markup=ws_rest_day_keyboard())
+    msg = await message.answer(text, reply_markup=finish_kb)
     temps["workout_menu"] = msg.message_id
     user_temp_messages[user_id] = temps
+
+async def _retry_session_feedback(callback, bot, state):
+    """Повторно генерирует ИИ-фидбек по завершённой тренировке."""
+    data = await state.get_data()
+    session_id = data.get("retry_session_id")
+    exercises = data.get("retry_session_exercises") or []
+    user_id = callback.from_user.id
+    if not session_id:
+        await callback.answer("Данные тренировки не найдены", show_alert=True)
+        return
+    await bot.send_chat_action(callback.message.chat.id, action=ChatAction.TYPING)
+    logs = get_session_exercise_logs(session_id)
+    feedback = await run_in_thread(gemini_session_feedback, logs, exercises)
+    if feedback.startswith("❌"):
+        await callback.message.edit_text(
+            "❌ ИИ снова не смог подготовить фидбек.\n\n"
+            "🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("session_feedback")
+        )
+        await callback.answer()
+        return
+    lines = ["Тренировка завершена\n"]
+    for log in logs:
+        if log["status"] == "skipped":
+            lines.append(f"⏭ {log['exercise_name']} — пропущено")
+        elif log.get("result") and log["result"].get("note"):
+            lines.append(f"⚠️ {log['exercise_name']} — {log['result']['note']}")
+    lines.append(f"\n{feedback}")
+    plan_data = get_ai_plan(user_id)
+    next_date, next_day = get_next_training_day(plan_data, user_id) if plan_data else (None, None)
+    if next_date:
+        lines.append(f"\nСледующая тренировка: {next_day}, {next_date}")
+    rank_data = get_or_create_rank_data(user_id)
+    if rank_data:
+        lines.append(f"\n✨ Текущий ранг: {get_rank_name(rank_data['current_rank'])}!")
+    await callback.message.edit_text("\n".join(lines),
+                                      reply_markup=ws_rest_day_keyboard())
+    await callback.answer()
 
 # --- Пропуск дня ---
 @router.callback_query(F.data == "ws_skip_day")
@@ -4866,8 +5412,18 @@ async def wp_monthly_review_start(callback: CallbackQuery, bot: Bot, state: FSMC
     recent = []
     for row in cursor.fetchall():
         recent.append({"date": row[0], "status": row[2]})
+    await state.update_data(retry_action="monthly_review")
     changes = await run_in_thread(gemini_monthly_review, plan_data["plan"], recent)
-    if not changes or changes.get("no_changes_needed") or not changes.get("changes"):
+    if not changes:
+        # Реальная ошибка ИИ — предлагаем повторить (не путать с «менять не нужно»)
+        await callback.message.edit_text(
+            "❌ Не удалось проанализировать прогресс.\n\n"
+            "🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("monthly_review")
+        )
+        await callback.answer()
+        return
+    if changes.get("no_changes_needed") or not changes.get("changes"):
         await callback.message.edit_text(
             "Менять ничего не нужно — план хорошо сбалансирован.",
             reply_markup=wp_settings_keyboard()
@@ -6292,33 +6848,32 @@ async def process_food_photo(message: Message, bot: Bot, state: FSMContext):
         return
     prompt = """Посмотри на фото еды и оцени калорийность.
 
-Ответь строго в формате: [название блюда] [число ккал]
-Название — 1-4 слова на русском. Число — только целые ккал без единиц.
+    Ответь строго в формате: [название блюда] [число ккал]
+    Название — 1-4 слова на русском. Число — только целые ккал без единиц.
 
-Правила оценки:
-- Считай реальную порцию на фото, не занижай
-- Учитывай видимые соусы, масло, хлеб рядом
-- Если несколько блюд — суммируй всё
+    Правила оценки:
+    - Считай реальную порцию на фото, не занижай
+    - Учитывай видимые соусы, масло, хлеб рядом
+    - Если несколько блюд — суммируй всё
 
-Примеры правильных ответов:
-гречка с курицей 480
-паста карбонара 650
-омлет с сыром 350
-бургер и картошка 900
-салат цезарь 520"""
-    try:
-        client = genai.Client(api_key=api_key)
-        image_part = types.Part.from_bytes(data=image_bytes, mime_type='image/png')
-        response = client.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=[image_part, prompt],
-            config=types.GenerateContentConfig(max_output_tokens=256)
+    Примеры правильных ответов:
+    гречка с курицей 480
+    паста карбонара 650
+    омлет с сыром 350
+    бургер и картошка 900
+    салат цезарь 520"""
+    # Сохраняем данные для повтора без повторной загрузки фото
+    await state.update_data(
+        retry_food_photo_bytes=image_bytes,
+        retry_food_photo_prompt=prompt,
+        retry_action="food_photo"
+    )
+    text = await run_in_thread(analyze_food_photo, image_bytes, prompt)
+    if text is None:
+        await wait_msg.edit_text(
+            "❌ Ошибка анализа фото.\n\n🔄 Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("food_photo")
         )
-        text = (response.text or "").strip() if hasattr(response, 'text') else ""
-        if not text and response.candidates and response.candidates[0].content.parts:
-            text = response.candidates[0].content.parts[0].text.strip()
-    except Exception as e:
-        await wait_msg.edit_text(f"❌ Ошибка анализа: {str(e)[:80]}")
         return
 
     description = "Блюдо на фото"
@@ -6394,12 +6949,12 @@ async def process_food_description(message: Message, bot: Bot, state: FSMContext
 Еда: {description}
 
 Ответь СТРОГО одним целым числом — суммарные килокалории. Никаких слов, никаких единиц:"""
+    await state.update_data(retry_food_description=description, retry_action="food_calories")
     response = gemini_generate(prompt, max_tokens=100, raw=True)
     try:
-        # Ищем наибольшее число в ответе (это итоговые калории, а не порции/граммы)
         numbers = re.findall(r"\b(\d{2,5})\b", response)
         numbers = [float(n) for n in numbers if 50 <= float(n) <= 9999]
-        calories = numbers[-1] if numbers else None  # берём последнее — обычно итог
+        calories = numbers[-1] if numbers else None
     except:
         calories = None
 
@@ -6407,8 +6962,8 @@ async def process_food_description(message: Message, bot: Bot, state: FSMContext
         await state.update_data(food_description=description)
         await state.set_state(DietState.manual_calories)
         msg = await message.answer(
-            "❌ Не удалось определить калории автоматически. Введи калории вручную (только число):",
-            reply_markup=food_cancel_keyboard()
+            "❌ Не удалось определить калории автоматически. Нажми кнопку чтобы попробовать ещё раз.",
+            reply_markup=retry_ai_keyboard("food_calories")
         )
         user_temp_messages.setdefault(user_id, {})['diet_temp'] = msg.message_id
         return
