@@ -520,12 +520,13 @@ def gemini_generate_json(prompt: str, max_tokens: int = 8192) -> str:
 def gemini_generate_rating(prompt: str, max_tokens: int = 1024) -> Optional[dict]:
     """Вызов Gemini через ОТДЕЛЬНЫЙ API-ключ (GOOGLE_API_KEY_RATINGS), используется
     только для авто-оценки категорий 'еда'/'активность'/'настрой'. Модель должна
-    ответить JSON {"rating": 1-10, "comment": "..."}. Возвращает None если ключ
-    не настроен или запрос не удался — вызывающий код должен в этом случае
+    ответить JSON {"rating": 1-10, "comment"/"response": "..."}. Возвращает None если
+    ключ не настроен или запрос не удался — вызывающий код должен в этом случае
     откатиться на ручной ввод оценки, а не выдумывать число."""
     api_key = os.environ.get("GOOGLE_API_KEY_RATINGS") or os.environ.get("GEMINI_API_KEY_RATINGS")
     if not api_key:
         return None
+    text = None
     try:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
@@ -540,15 +541,23 @@ def gemini_generate_rating(prompt: str, max_tokens: int = 1024) -> Optional[dict
         if not text and response.candidates and response.candidates[0].content.parts:
             text = response.candidates[0].content.parts[0].text
         if not text:
+            print(f"[GEMINI-RATINGS] Пустой ответ от модели. finish_reason: "
+                  f"{getattr(response.candidates[0], 'finish_reason', '?') if response.candidates else '?'}")
             return None
         text = text.strip()
         text = re.sub(r'^```json\s*|\s*```$', '', text).strip()
         data = json.loads(text)
         rating = max(1, min(10, int(round(float(data.get('rating'))))))
-        comment = str(data.get('comment', '')).strip()
+        # разные промпты просят модель назвать поле по-разному ('comment' у Еды/Активности,
+        # 'response' у Настроя) - читаем любое из них, чтобы текст не терялся
+        comment = str(data.get('comment') or data.get('response') or '').strip()
         return {'rating': rating, 'comment': comment}
     except Exception as e:
-        print(f"[GEMINI-RATINGS] Ошибка: {e}")
+        import traceback
+        print(f"[GEMINI-RATINGS] Ошибка ({type(e).__name__}): {e}")
+        if text is not None:
+            print(f"[GEMINI-RATINGS] Ответ модели, который не удалось разобрать: {repr(text[:300])}")
+        traceback.print_exc()
         return None
 
 def photo_analysis_cancel_keyboard():
