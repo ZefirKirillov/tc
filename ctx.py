@@ -1,4 +1,4 @@
-#v1.4.0 (local edition — Render/Turso removed)
+#v2.0.0 (Turso edition — persistent DB across redeploys)
 from aiogram import Router
 import asyncio
 import sqlite3
@@ -6,6 +6,10 @@ import threading
 import os
 import re
 import math
+try:
+    import libsql
+except ImportError:
+    libsql = None
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Tuple, List, Any
@@ -140,22 +144,80 @@ MAX_SPARKS_PER_DAY = 2
 SPARK_FOR_CATEGORIES = 1
 SPARK_FOR_WORKOUT = 1
 
-# ============ БАЗА ДАННЫХ (локальный SQLite) ============
-# Путь к файлу базы данных. По умолчанию — tracker.db рядом со скриптом,
-# можно переопределить через переменную окружения DB_PATH.
+# ============ БАЗА ДАННЫХ (Turso, с фолбэком на локальный SQLite) ============
+# Путь к локальному файлу — используется только если Turso не настроен
+# (например, при локальной разработке без облачной БД).
 DB_PATH = os.environ.get('DB_PATH', 'tracker.db')
+
+# Если заданы обе переменные — бот подключается напрямую к Turso по сети,
+# без локального файла вообще, так что редеплой (даже на платформе с
+# эфемерной файловой системой вроде Infrlo) базу не трогает.
+TURSO_DATABASE_URL = os.environ.get('TURSO_DATABASE_URL')
+TURSO_AUTH_TOKEN = os.environ.get('TURSO_AUTH_TOKEN')
+USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and libsql is not None)
+
+class _CompatRow:
+    """Даёт результату из libsql тот же интерфейс, что и sqlite3.Row:
+    доступ по индексу, по имени колонки, dict(row), .keys() — чтобы весь
+    остальной код (написанный под sqlite3.Row) не пришлось переписывать."""
+    __slots__ = ('_cols', '_data')
+
+    def __init__(self, cols, values):
+        self._cols = cols
+        self._data = tuple(values)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._data[self._cols.index(key)]
+        return self._data[key]
+
+    def keys(self):
+        return list(self._cols)
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __repr__(self):
+        return f"<Row {dict(zip(self._cols, self._data))}>"
+
+class _CompatCursor:
+    """Оборачивает курсор libsql так, чтобы fetchone()/fetchall() возвращали
+    _CompatRow вместо голых кортежей (как sqlite3.Row делает для sqlite3)."""
+
+    def __init__(self, raw_cursor):
+        self._cur = raw_cursor
+
+    def _cols(self):
+        return [d[0] for d in (self._cur.description or [])]
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return None if row is None else _CompatRow(self._cols(), row)
+
+    def fetchall(self):
+        cols = self._cols()
+        return [_CompatRow(cols, r) for r in self._cur.fetchall()]
+
+    @property
+    def lastrowid(self):
+        return getattr(self._cur, 'lastrowid', None)
+
+    @property
+    def rowcount(self):
+        return getattr(self._cur, 'rowcount', -1)
 
 class Database:
     """
-    Обёртка над одним постоянным локальным соединением sqlite3.
-    Приложение однопоточное (все обращения к БД идут из основного
-    event-loop потока aiogram, фоновые задачи в run_in_thread работают
-    только с Gemini, а не с БД), поэтому одно соединение с блокировкой
-    безопасно и не течёт файловыми дескрипторами, в отличие от старой
-    схемы «новое соединение на каждый запрос».
-    row_factory = sqlite3.Row даёт доступ к колонкам и по индексу,
-    и по имени (row['col']), и dict(row) собирает обычный словарь —
-    так что остальной код не нужно менять.
+    Обёртка над одним постоянным соединением с базой данных.
+    Режим 'turso': подключение напрямую к облачной Turso по сети, без
+    локального файла - данные переживают любой редеплой.
+    Режим 'sqlite': локальный файл, как раньше (фолбэк для локальной
+    разработки без облачной БД).
+    Оба режима дают одинаковый интерфейс execute()/commit()/close(), так что
+    остальной код бота не завязан на то, какой режим сейчас активен.
     """
     _instance = None
 
@@ -166,19 +228,38 @@ class Database:
         return cls._instance
 
     def _init_connection(self):
-        self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
         self._lock = threading.RLock()
+        if USE_TURSO:
+            self._mode = 'turso'
+            self._conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+        else:
+            self._mode = 'sqlite'
+            self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON")
 
-    def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
+    def execute(self, query: str, params: tuple = ()):
         with self._lock:
-            cur = self._conn.cursor()
-            cur.execute(query, params)
-            # Автокоммит для INSERT/UPDATE/DELETE/DDL
-            if query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'PRAGMA')):
-                self._conn.commit()
-            return cur
+            is_write = query.strip().upper().startswith(
+                ('INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'PRAGMA')
+            )
+            if self._mode == 'turso':
+                cur = self._conn.execute(query, params)
+                if is_write:
+                    try:
+                        self._conn.commit()
+                    except Exception as e:
+                        # Некоторые режимы Turso автокоммитят каждый запрос сами -
+                        # тогда commit() может быть не нужен/не поддержан. Не роняем
+                        # бота из-за этого, но логируем на случай если причина другая.
+                        print(f"[DB-TURSO] commit() после записи: {e}")
+                return _CompatCursor(cur)
+            else:
+                cur = self._conn.cursor()
+                cur.execute(query, params)
+                if is_write:
+                    self._conn.commit()
+                return cur
 
     def commit(self):
         with self._lock:
@@ -190,23 +271,33 @@ class Database:
 
 db = Database()
 
+
 def log_db_persistence_diagnostics():
-    """Печатает в лог, откуда фактически читается/пишется БД при каждом старте.
-    Полезно для диагностики 'после редеплоя бот всё забыл' - если абсолютный
-    путь или количество строк в таблицах каждый раз разные, значит файл БД
-    не сохраняется между деплоями (нужен persistent volume на этом пути)."""
+    """Печатает в лог, какой режим БД активен и куда фактически идут данные.
+    Полезно для диагностики 'после редеплоя бот всё забыл'."""
+    print(f"[DB] Режим: {'Turso (удалённая БД, без локального файла)' if USE_TURSO else 'локальный файл SQLite'}")
+    if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and libsql is None:
+        print("[DB] ⚠️ TURSO_DATABASE_URL и TURSO_AUTH_TOKEN заданы, но пакет libsql не установлен - "
+              "добавь 'libsql' в requirements.txt. Пока используется локальный файл (не переживёт редеплой).")
+    if USE_TURSO:
+        print(f"[DB] TURSO_DATABASE_URL: {TURSO_DATABASE_URL}")
+        try:
+            tasks_count = db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            ratings_count = db.execute("SELECT COUNT(*) FROM ratings").fetchone()[0]
+            print(f"[DB] Текущие данные в Turso: tasks={tasks_count}, ratings={ratings_count}")
+        except Exception as e:
+            print(f"[DB] Не удалось прочитать счётчики строк из Turso (возможно таблицы ещё не созданы): {e}")
+        return
     abs_path = os.path.abspath(DB_PATH)
     existed_before = os.path.exists(abs_path)
     size = os.path.getsize(abs_path) if existed_before else 0
     print(f"[DB] DB_PATH env: {os.environ.get('DB_PATH', '<не задан, используется default tracker.db>')}")
     print(f"[DB] Абсолютный путь к файлу БД: {abs_path}")
     print(f"[DB] Файл существовал до старта: {existed_before} (размер: {size} байт)")
-    if not os.environ.get('DB_PATH'):
-        print("[DB] ⚠️ DB_PATH не задан через переменную окружения - используется относительный "
-              "путь 'tracker.db' в рабочей директории процесса. На большинстве хостингов "
-              "(Railway/Render/Fly.io/Docker без volume) файловая система контейнера "
-              "пересоздаётся при каждом деплое, и этот файл будет каждый раз новым/пустым. "
-              "Смонтируйте persistent volume и укажите DB_PATH на путь внутри него.")
+    print("[DB] ⚠️ Turso не настроен (нет TURSO_DATABASE_URL/TURSO_AUTH_TOKEN) - используется локальный "
+          "файл. На большинстве хостингов с эфемерной файловой системой (в т.ч. Infrlo) он не "
+          "переживёт редеплой. Задай TURSO_DATABASE_URL и TURSO_AUTH_TOKEN, чтобы данные хранились "
+          "в облаке Turso и не терялись.")
     try:
         tasks_count = db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         ratings_count = db.execute("SELECT COUNT(*) FROM ratings").fetchone()[0]
