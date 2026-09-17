@@ -214,6 +214,19 @@ def log_db_persistence_diagnostics():
     except Exception as e:
         print(f"[DB] Не удалось прочитать счётчики строк (возможно таблицы ещё не созданы): {e}")
 
+def log_ratings_ai_diagnostics():
+    """Печатает при старте, настроен ли отдельный ключ для авто-оценки Еды/Активности/Настроя.
+    Если ключа нет - sync_diet_rating_for_today/sync_activity_rating_for_today и мод-флоу
+    молча ничего не делают (это осознанное поведение - чтобы не выдумывать оценку),
+    поэтому по симптомам ('значения не обновляются', 'настрой всегда просит оценить вручную')
+    это выглядит как баг, хотя на самом деле просто не задана переменная окружения."""
+    key_present = bool(os.environ.get("GOOGLE_API_KEY_RATINGS") or os.environ.get("GEMINI_API_KEY_RATINGS"))
+    print(f"[RATINGS-AI] GOOGLE_API_KEY_RATINGS настроен: {key_present}")
+    if not key_present:
+        print("[RATINGS-AI] ⚠️ Ключ не задан - авто-оценка 'еда'/'активность' и AI-оценка 'настроя' "
+              "не будут работать (тихо ничего не делают), 'настрой' всегда будет уходить в ручной ввод. "
+              "Задайте переменную окружения GOOGLE_API_KEY_RATINGS с ключом Google AI Studio.")
+
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def get_current_rank(total_sparks: int) -> int:
     current_rank = 1
@@ -2898,6 +2911,7 @@ async def show_reflection_menu(user_id: int, chat_id: int, bot: Bot, state: FSMC
     # конце дня) - если пользователь уже заполнил всё, что доступно ему вручную, незачем
     # бесконечно звать его обратно в "что оценим?" в ожидании авто-категорий.
     if manual_categories_completed(user_id):
+        update_streak(user_id)
         await bot.send_message(
             chat_id,
             f"{name}, на сегодня с рефлексией всё! 🎉\n"
@@ -7389,6 +7403,7 @@ async def main():
     init_db()
     print("[BOOT] База инициализирована")
     log_db_persistence_diagnostics()
+    log_ratings_ai_diagnostics()
     
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
