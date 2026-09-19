@@ -1,4 +1,4 @@
-#v2.0.0 (Turso edition — persistent DB across redeploys)
+#v2.0.0 fixed menu
 from aiogram import Router
 import asyncio
 import sqlite3
