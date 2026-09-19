@@ -21,7 +21,7 @@ from PIL import Image
 from aiogram.filters import StateFilter
 
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, ReplyKeyboardMarkup, KeyboardButton, TelegramObject
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, TelegramObject
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -131,51 +131,48 @@ bot_instance = None
 
 # ============ УНИВЕРСАЛЬНАЯ КНОПКА «НАЗАД» ============
 BACK_BUTTON_TEXT = "🔙 Назад"
-user_back_kb: Dict[int, int] = {}        # id сообщения-носителя reply-клавиатуры
+BACK_BUTTON_CALLBACK = "nav_back"
 user_nav: Dict[int, List[str]] = {}      # стек экранов для кнопки «Назад»
 SCREEN_RENDER: Dict[str, Any] = {}       # имя экрана -> async fn(bot, user_id, chat_id, state)
 
+def _back_button_row():
+    return [InlineKeyboardButton(text=BACK_BUTTON_TEXT, callback_data=BACK_BUTTON_CALLBACK)]
+
+def _has_back_button(rows) -> bool:
+    for row in rows or []:
+        for btn in row or []:
+            if getattr(btn, "callback_data", None) == BACK_BUTTON_CALLBACK:
+                return True
+    return False
+
+def with_back_kb(rows):
+    """Принимает список строк inline-кнопок и дописывает вниз строку с
+    универсальной кнопкой «🔙 Назад». Идемпотентно: если кнопка уже есть,
+    возвращает исходный список без изменений."""
+    rows = rows or []
+    if _has_back_button(rows):
+        return rows
+    rows = [row for row in rows]
+    rows.append(_back_button_row())
+    return rows
+
 def back_reply_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=BACK_BUTTON_TEXT, callback_data="nav_back")]]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[_back_button_row()])
 
 async def ensure_back_keyboard(bot: Bot, chat_id: int, user_id: int):
-    """Отправляет сообщение с inline-кнопкой «Назад» если пользователь ещё не получал его."""
-    if user_id in user_back_kb:
-        return
-    try:
-        msg = await bot.send_message(
-            chat_id, "⬇️ Кнопка «Назад» всегда под рукой",
-            reply_markup=back_reply_keyboard()
-        )
-        user_back_kb[user_id] = msg.message_id
-    except Exception as e:
-        print(f"[NAV] Не удалось отправить inline-клавиатуру: {e}")
+    """Раньше кнопка «Назад» жила на отдельном постоянном сообщении с
+    reply-клавиатурой (Telegram разрешает только одну клавиатуру на сообщение).
+    Теперь она прикреплена к каждому сообщению с inline-кнопками через
+    with_back_kb(), так что отдельное сообщение больше не нужно."""
+    return
 
 class BackKeyboardMiddleware(BaseMiddleware):
-    """До этого ensure_back_keyboard() вызывался только из send_main_menu,
-    поэтому кнопка «Назад» появлялась только у тех, кто уже побывал в главном
-    меню - множество экранов (рефлексия, диета, тренировки, задачи и т.д.)
-    открываются напрямую по инлайн-кнопкам и never проходили через send_main_menu.
-    Эта миддлварь проверяет/отправляет клавиатуру перед КАЖДЫМ действием
-    пользователя, так что кнопка гарантированно появится независимо от того,
-    через какой экран пользователь впервые зашёл. ensure_back_keyboard сама
-    по себе - no-op после первого раза (просто проверка словаря), так что
-    накладные расходы на каждое сообщение минимальны."""
+    """Кнопка «Назад» теперь прикрепляется к каждому сообщению с inline-кнопками
+    прямо при его отправке (через with_back_kb() в каждой клавиатурной функции и
+    в _screen_send), поэтому отдельное сообщение-носитель больше не нужно.
+    Миддлварь оставлена как no-op, чтобы не ломать существующие вызовы
+    ensure_back_keyboard()."""
     async def __call__(self, handler, event: TelegramObject, data: dict):
-        bot = data.get('bot')
-        user = getattr(event, 'from_user', None)
-        chat = getattr(event, 'chat', None)
-        if chat is None:
-            message = getattr(event, 'message', None)
-            if message is not None:
-                chat = message.chat
-        if bot and user and chat:
-            try:
-                await ensure_back_keyboard(bot, chat.id, user.id)
-            except Exception as e:
-                print(f"[NAV] Ошибка в BackKeyboardMiddleware: {e}")
         return await handler(event, data)
 
 router.message.outer_middleware(BackKeyboardMiddleware())
@@ -658,13 +655,12 @@ def analyze_food_photo(image_bytes: bytes, prompt: str) -> Optional[str]:
         return None
 
 def photo_analysis_cancel_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="❌ Отмена", callback_data="photo_analysis_cancel")]
-    ])
+    ]))
 
 def photo_analysis_back_keyboard():
-    # Навигация — через универсальную reply-кнопку «🔙 Назад»
-    return None
+    return InlineKeyboardMarkup(inline_keyboard=[_back_button_row()])
 
 @router.callback_query(F.data == "menu_photo_analysis")
 async def handle_photo_analysis_start(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -897,7 +893,7 @@ def user_weekday(user_id: int) -> int:
 
 def timezone_picker_keyboard(context: str = "onboarding"):
     rows = [[InlineKeyboardButton(text=label, callback_data=f"tz:{tz}:{context}")] for label, tz in RUSSIAN_TIMEZONES]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(rows))
 
 def update_streak(user_id: int):
     today = user_today_str(user_id)
@@ -2498,45 +2494,45 @@ def init_db():
     
 # ============ КЛАВИАТУРЫ ============
 def main_menu_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="📒 Рефлексия", callback_data="menu_reflection"),
          InlineKeyboardButton(text="⭐ Ранг", callback_data="menu_rank")],
         [InlineKeyboardButton(text="🏋️ Тренировки", callback_data="menu_workouts"),
          InlineKeyboardButton(text="Check AI", callback_data="menu_ai")],
         [InlineKeyboardButton(text="🍽 Диета", callback_data="menu_diet"),
          InlineKeyboardButton(text="📝 Задачи", callback_data="menu_tasks")]
-    ])
+    ]))
 
 def reflection_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="😴 Сон", callback_data="refl:сон"),
          InlineKeyboardButton(text="🎮 Зависание", callback_data="refl:зависание")],
         [InlineKeyboardButton(text="🎯 Настрой", callback_data="refl:настрой")]
-    ])
+    ]))
 
 def rating_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text=str(i), callback_data=f"rate:{i}") for i in range(1, 6)],
         [InlineKeyboardButton(text=str(i), callback_data=f"rate:{i}") for i in range(6, 11)]
-    ])
+    ]))
     return keyboard
 
 def ai_reply_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="💡 Дай мне совет", callback_data="ai_advice")]
-    ])
+    ]))
 
 def low_rating_keyboard(category: str):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🤖 Разобрать с ИИ", callback_data=f"analyze_low:{category}")],
         [InlineKeyboardButton(text="🔙 Пропустить", callback_data="skip_analysis")]
-    ])
+    ]))
     return keyboard
 
 def retry_ai_keyboard(action: str):
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data=f"retry_ai:{action}")]
-    ])
+    ]))
 
 @router.callback_query(F.data.startswith("retry_ai:"))
 async def retry_ai_action(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -2948,12 +2944,12 @@ async def _retry_monthly_review(callback, bot, state):
     nav_push(callback.from_user.id, "wp_review_decline_prompt")
 
 def workout_main_reply_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🏋️ Добавить выполнение", callback_data="menu_workout_add"),
          InlineKeyboardButton(text="🤳 Анализ фото", callback_data="menu_photo_analysis")],
         [InlineKeyboardButton(text="📋 Управление", callback_data="menu_workout_manage"),
          InlineKeyboardButton(text="📊 История", callback_data="workout_history")]
-    ])
+    ]))
 
 def workout_manage_reply_keyboard(mode: str = "ai"):
     """Клавиатура управления планом."""
@@ -2963,7 +2959,7 @@ def workout_manage_reply_keyboard(mode: str = "ai"):
     ]
     if mode == "ai":
         rows.insert(0, [InlineKeyboardButton(text="✏️ Редактировать план (ИИ)", callback_data="wp_edit_plan")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(rows))
 
 def workout_main_keyboard():
     return workout_main_reply_keyboard()
@@ -2982,14 +2978,14 @@ def workout_categories_keyboard(categories: List[Tuple[int, str]], action: str =
             row = []
     if action == "manage":
         buttons.append([InlineKeyboardButton(text="➕ Создать категорию", callback_data="w_cat_new")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons))
 
 def workout_category_actions_keyboard(cat_id: int):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="📋 Упражнения", callback_data=f"w_manage_exercises_{cat_id}")],
         [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"w_cat_rename_{cat_id}"),
          InlineKeyboardButton(text="❌ Удалить", callback_data=f"w_cat_delete_{cat_id}")]
-    ])
+    ]))
     return keyboard
 
 def workout_exercises_keyboard(exercises: List[Tuple[int, str]], cat_id: int, action: str = "add"):
@@ -3006,81 +3002,80 @@ def workout_exercises_keyboard(exercises: List[Tuple[int, str]], cat_id: int, ac
             row = []
     if action == "manage":
         buttons.append([InlineKeyboardButton(text="➕ Создать упражнение", callback_data=f"w_ex_new_{cat_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons))
 
 def workout_exercise_actions_keyboard(ex_id: int):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"w_ex_rename_{ex_id}"),
          InlineKeyboardButton(text="❌ Удалить", callback_data=f"w_ex_delete_{ex_id}")],
         [InlineKeyboardButton(text="🎯 Установить цель", callback_data=f"w_ex_set_goal_{ex_id}")]
-    ])
+    ]))
     return keyboard
 
 def workout_continue_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✅ Добавить ещё", callback_data="w_continue_yes")],
         [InlineKeyboardButton(text="❌ Закончить", callback_data="workout_main")]
-    ])
+    ]))
     return keyboard
 
 def workout_exercise_goal_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🎯 Силовое", callback_data="goal_strength")],
         [InlineKeyboardButton(text="🚴 Кардио", callback_data="goal_cardio")]
-    ])
+    ]))
     return keyboard
 
 def workout_action_choice_keyboard(ex_id: int):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="📝 Ввести вручную", callback_data=f"w_manual_{ex_id}")],
         [InlineKeyboardButton(text="🎯 Цель достигнута", callback_data=f"w_achieve_goal_{ex_id}")]
-    ])
+    ]))
     return keyboard
 
 def stats_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="📆 Неделя", callback_data="stats:week"),
          InlineKeyboardButton(text="🗓 Месяц", callback_data="stats:month")],
         [InlineKeyboardButton(text="📈 График неделя", callback_data="stats:chart_week"),
          InlineKeyboardButton(text="📈 График месяц", callback_data="stats:chart_month")]
-    ])
+    ]))
     return keyboard
 
 def rank_back_keyboard():
-    # Навигация — через универсальную reply-кнопку «🔙 Назад»
-    return None
+    return InlineKeyboardMarkup(inline_keyboard=[_back_button_row()])
 
 def diet_menu_reply_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🍎 Записать еду", callback_data="diet_food"),
          InlineKeyboardButton(text="⚖️ Записать вес", callback_data="diet_weight")],
         [InlineKeyboardButton(text="🧮 Рассчитать % жира", callback_data="diet_bodyfat"),
          InlineKeyboardButton(text="📖 История еды", callback_data="diet_food_history")],
         [InlineKeyboardButton(text="📈 Графики веса и % жира", callback_data="diet_charts"),
          InlineKeyboardButton(text="⚙️ Изменить цель", callback_data="diet_goal")]
-    ])
+    ]))
 
 def meal_type_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🍳 Завтрак", callback_data="meal_type:Завтрак"),
          InlineKeyboardButton(text="🥗 Обед", callback_data="meal_type:Обед")],
         [InlineKeyboardButton(text="🍽 Ужин", callback_data="meal_type:Ужин"),
          InlineKeyboardButton(text="🍪 Перекус", callback_data="meal_type:Перекус")],
         [InlineKeyboardButton(text="🔙 Отмена", callback_data="meal_entry_cancel")]
-    ])
+    ]))
     return keyboard
 
 def meal_chosen_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✏️ Записать калории вручную", callback_data="meal_entry_manual")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="meal_entry_cancel")]
-    ])
+    ]))
 
 def save_food_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="💾 Сохранить в «Мои блюда»", callback_data="save_food_yes")],
         [InlineKeyboardButton(text="➡️ Пропустить", callback_data="save_food_skip")]
-    ])
+    ]))
 
 def my_foods_keyboard(foods: List[Tuple[str, float]]):
     buttons = []
@@ -3088,60 +3083,60 @@ def my_foods_keyboard(foods: List[Tuple[str, float]]):
         buttons.append([InlineKeyboardButton(text=f"{name} ({int(calories)} ккал)", callback_data=f"food_choose_{name}")])
     buttons.append([InlineKeyboardButton(text="➕ Создать новое блюдо", callback_data="food_create_new")])
     buttons.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="food_cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons))
 
 def gender_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🚹 Мужской", callback_data="gender_male"),
          InlineKeyboardButton(text="🚺 Женский", callback_data="gender_female")]
-    ])
+    ]))
     return keyboard
 
 def activity_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="1️⃣ Сидячий (нет тренировок)", callback_data="activity_1.2")],
         [InlineKeyboardButton(text="2️⃣ Лёгкий (1-3 раза/нед)", callback_data="activity_1.375")],
         [InlineKeyboardButton(text="3️⃣ Умеренный (3-5 раз/нед)", callback_data="activity_1.55")],
         [InlineKeyboardButton(text="4️⃣ Высокий (6-7 раз/нед)", callback_data="activity_1.725")],
         [InlineKeyboardButton(text="5️⃣ Очень высокий (физ. работа + спорт)", callback_data="activity_1.9")]
-    ])
+    ]))
     return keyboard
 
 def goal_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🔻 Снизить вес", callback_data="goal_loss")],
         [InlineKeyboardButton(text="🔹 Поддерживать вес", callback_data="goal_maintain")],
         [InlineKeyboardButton(text="🔺 Набрать вес", callback_data="goal_gain")]
-    ])
+    ]))
     return keyboard
 
 def diet_confirm_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✅ Подтвердить", callback_data="diet_confirm")],
         [InlineKeyboardButton(text="🔄 Заново", callback_data="diet_restart")]
-    ])
+    ]))
     return keyboard
 
 def diet_confirm_food_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✅ Да, верно", callback_data="food_confirm_yes")],
         [InlineKeyboardButton(text="🔄 Ввести заново", callback_data="food_confirm_redo")],
         [InlineKeyboardButton(text="✏️ Ввести калории вручную", callback_data="food_confirm_manual")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="food_cancel")]
-    ])
+    ]))
     return keyboard
 
 def food_add_more_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✅ Да, добавить ещё", callback_data="food_add_more_yes")],
         [InlineKeyboardButton(text="❌ Нет, в меню", callback_data="back_to_main")]
-    ])
+    ]))
     return keyboard
 
 def food_cancel_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="❌ Отмена", callback_data="food_cancel")]
-    ])
+    ]))
     return keyboard
     
 
@@ -3171,19 +3166,19 @@ def tasks_menu_keyboard(tasks: list, user_id: Optional[int] = None) -> InlineKey
                 InlineKeyboardButton(text="🗑", callback_data=f"task_del_{t['id']}")
             ])
     buttons.append([InlineKeyboardButton(text="➕ Новая задача", callback_data="task_new")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons))
 
 def tasks_confirm_keyboard(task_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✅ Да, выполнена", callback_data=f"task_confirm_{task_id}"),
          InlineKeyboardButton(text="❌ Нет", callback_data="back_to_main")]
-    ])
+    ]))
 
 def task_repeat_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="1️⃣ Разовая", callback_data="task_type_once")],
         [InlineKeyboardButton(text="🔁 Повторяющаяся", callback_data="task_type_repeat")]
-    ])
+    ]))
 
 def task_days_keyboard(selected: list) -> InlineKeyboardMarkup:
     days = [(0,"Пн"),(1,"Вт"),(2,"Ср"),(3,"Чт"),(4,"Пт"),(5,"Сб"),(6,"Вс")]
@@ -3194,19 +3189,19 @@ def task_days_keyboard(selected: list) -> InlineKeyboardMarkup:
         row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"task_day_{num}"))
     buttons.append(row)
     buttons.append([InlineKeyboardButton(text="✔️ Готово", callback_data="task_days_done")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons))
 
 def task_priority_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🔥 Да, важная", callback_data="task_priority_yes"),
          InlineKeyboardButton(text="Нет", callback_data="task_priority_no")]
-    ])
+    ]))
 
 def task_deadline_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="📅 Добавить дедлайн", callback_data="task_deadline_yes"),
          InlineKeyboardButton(text="Пропустить", callback_data="task_deadline_no")]
-    ])
+    ]))
 
 def urgent_tasks_keyboard(tasks: list, user_id: Optional[int] = None) -> Optional[InlineKeyboardMarkup]:
     """Инлайн-кнопки срочных задач для главного меню."""
@@ -3220,62 +3215,61 @@ def urgent_tasks_keyboard(tasks: list, user_id: Optional[int] = None) -> Optiona
         if t.get('days_left') is not None:
             label += f" – {days_left_str(t['deadline'], user_id)}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"task_done_{t['id']}")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons))
 
 
 # ============ КЛАВИАТУРЫ ДЛЯ ИИ-ПЛАНА ============
 def wp_mode_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🤖 Создать план с ИИ", callback_data="wp_mode_ai")],
         [InlineKeyboardButton(text="📝 Ввести свой план", callback_data="wp_mode_manual")]
-    ])
+    ]))
 
 def wp_goal_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="💪 Набор массы", callback_data="wp_goal_mass")],
         [InlineKeyboardButton(text="🔥 Похудение", callback_data="wp_goal_loss")],
         [InlineKeyboardButton(text="⚡ Сила", callback_data="wp_goal_strength")],
         [InlineKeyboardButton(text="🎯 Общая форма", callback_data="wp_goal_fitness")]
-    ])
+    ]))
 
 def wp_level_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🌱 Новичок", callback_data="wp_level_beginner")],
         [InlineKeyboardButton(text="📈 Средний", callback_data="wp_level_intermediate")],
         [InlineKeyboardButton(text="🏆 Продвинутый", callback_data="wp_level_advanced")]
-    ])
+    ]))
 
 def wp_days_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="2", callback_data="wp_days_2"),
          InlineKeyboardButton(text="3", callback_data="wp_days_3"),
          InlineKeyboardButton(text="4", callback_data="wp_days_4"),
          InlineKeyboardButton(text="5", callback_data="wp_days_5")]
-    ])
+    ]))
 
 def wp_plan_review_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✅ Принять план", callback_data="wp_plan_accept")],
         [InlineKeyboardButton(text="✏️ Редактировать", callback_data="wp_plan_edit")],
         [InlineKeyboardButton(text="🔄 Сгенерировать заново", callback_data="wp_plan_regenerate")]
-    ])
+    ]))
 
 def wp_plan_review_keyboard_manual():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="✅ Принять план", callback_data="wp_plan_accept")],
         [InlineKeyboardButton(text="✏️ Редактировать", callback_data="wp_plan_edit")],
         [InlineKeyboardButton(text="🔄 Ввести заново", callback_data="wp_mode_manual")]
-    ])
+    ]))
 
 def wp_edit_keyboard():
-    # Навигация — через универсальную reply-кнопку «🔙 Назад»
-    return None
+    return InlineKeyboardMarkup(inline_keyboard=[_back_button_row()])
 
 def ws_today_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="ПОГНАЛИ 💪", callback_data="ws_start")],
         [InlineKeyboardButton(text="Пропустил день", callback_data="ws_skip_day")]
-    ])
+    ]))
 
 def ws_exercise_keyboard(is_first: bool = True):
     buttons = [
@@ -3284,21 +3278,19 @@ def ws_exercise_keyboard(is_first: bool = True):
     ]
     if not is_first:
         buttons.append([InlineKeyboardButton(text="↩️ Предыдущее упражнение", callback_data="ws_ex_prev")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons))
 
 def ws_skip_day_keyboard():
-    # Навигация — через универсальную reply-кнопку «🔙 Назад»
-    return None
+    return InlineKeyboardMarkup(inline_keyboard=[_back_button_row()])
 
 def ws_rest_day_keyboard():
-    # Навигация — через универсальную reply-кнопку «🔙 Назад»
-    return None
+    return InlineKeyboardMarkup(inline_keyboard=[_back_button_row()])
 
 def wp_settings_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="🔄 Обновить план", callback_data="wp_reset")],
         [InlineKeyboardButton(text="📋 Пересмотр упражнений", callback_data="wp_monthly_review")]
-    ])
+    ]))
 
 def wp_monthly_review_keyboard(changes: list):
     buttons = []
@@ -3309,12 +3301,12 @@ def wp_monthly_review_keyboard(changes: list):
         )])
     buttons.append([InlineKeyboardButton(text="✅ Принять выбранные", callback_data="wp_review_accept")])
     buttons.append([InlineKeyboardButton(text="❌ Отклонить всё", callback_data="wp_review_decline")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons))
 
 def workout_ai_main_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=with_back_kb([
         [InlineKeyboardButton(text="📋 Настройки плана", callback_data="wp_settings")]
-    ])
+    ]))
 
 # ============ ФОРМИРОВАНИЕ МЕНЮ ============
 def format_main_menu(user_id: int) -> str:
@@ -3427,9 +3419,9 @@ async def cmd_start(message: Message, bot: Bot):
 
 👇 Нажми кнопку **«ПОГНАЛИ 💪»**, чтобы начать!
         """
-        markup = InlineKeyboardMarkup(inline_keyboard=[
+        markup = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
             [InlineKeyboardButton(text="ПОГНАЛИ 💪", callback_data="ws_start")]
-        ])
+        ]))
         msg = await bot.send_message(message.chat.id, welcome_text, parse_mode="Markdown", reply_markup=markup)
         user_welcome_message[user_id] = msg.message_id
         asyncio.create_task(delete_welcome_after_delay(user_id, bot, msg.message_id))
@@ -3563,7 +3555,8 @@ async def handle_category(callback: CallbackQuery, bot: Bot, state: FSMContext):
         await delete_message_safe(bot, callback.message.chat.id, temps.get('reflection'))
         await state.set_state(RatingState.waiting_for_mood_text)
         msg = await callback.message.answer(
-            "🎯 Опиши в паре предложений, как прошёл твой день и что ты сегодня чувствовал(а):"
+            "🎯 Опиши в паре предложений, как прошёл твой день и что ты сегодня чувствовал(а):",
+            reply_markup=back_reply_keyboard()
         )
         temps['rating'] = msg.message_id
         user_temp_messages[user_id] = temps
@@ -4178,10 +4171,12 @@ async def workout_manual_enter(callback: CallbackQuery, bot: Bot, state: FSMCont
     await callback.message.delete()
     if ex_type == 'cardio':
         await state.set_state(WorkoutState.entering_distance)
-        msg = await callback.message.answer("Введи дистанцию в км (или отправь '-', если не хочешь указывать):")
+        msg = await callback.message.answer("Введи дистанцию в км (или отправь '-', если не хочешь указывать):",
+                                             reply_markup=back_reply_keyboard())
     else:
         await state.set_state(WorkoutState.entering_reps)
-        msg = await callback.message.answer("Введи повторения.\nПримеры: 10, 10,8,6 или 3x10")
+        msg = await callback.message.answer("Введи повторения.\nПримеры: 10, 10,8,6 или 3x10",
+                                             reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
@@ -4202,7 +4197,8 @@ async def workout_enter_reps(message: Message, bot: Bot, state: FSMContext):
             reps_str = ','.join(str(r) for r in reps_list)
             await state.update_data(sets=sets, reps=reps_str)
             await state.set_state(WorkoutState.entering_weight)
-            msg = await message.answer("Введи вес в кг (или отправь '-', если не хочешь указывать):")
+            msg = await message.answer("Введи вес в кг (или отправь '-', если не хочешь указывать):",
+                                       reply_markup=back_reply_keyboard())
         except ValueError:
             msg = await message.answer("❌ Неверный формат. Попробуй ещё раз (например, 10, 10,8,6 или 3x10):")
     else:
@@ -4218,7 +4214,8 @@ async def workout_enter_reps(message: Message, bot: Bot, state: FSMContext):
             pass
         await state.update_data(distance=None, duration=None)
         await state.set_state(WorkoutState.entering_distance)
-        msg = await message.answer("Введи дистанцию в км (или отправь '-', если не хочешь указывать):")
+        msg = await message.answer("Введи дистанцию в км (или отправь '-', если не хочешь указывать):",
+                                    reply_markup=back_reply_keyboard())
 
     user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
@@ -4335,7 +4332,8 @@ async def workout_enter_distance(message: Message, bot: Bot, state: FSMContext):
     await delete_message_safe(bot, message.chat.id, temps.get('workout_temp'))
     await state.update_data(distance=distance)
     await state.set_state(WorkoutState.entering_duration)
-    msg = await message.answer("Введи время в минутах (или отправь '-', если не хочешь указывать):")
+    msg = await message.answer("Введи время в минутах (или отправь '-', если не хочешь указывать):",
+                                reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 @router.message(WorkoutState.entering_duration)
@@ -4559,7 +4557,8 @@ async def wp_choose_manual(callback: CallbackQuery, bot: Bot, state: FSMContext)
         "Неделя 3 - Жим на наклонной - 3x11(90кг)\n"
         "Разгибания трицепса - 3x12(40кг)\n\n"
         "Упражнения без метки «Неделя N» дублируются во все недели.\n\n"
-        "⚠️ Чем точнее формат — тем лучше ИИ разберёт план."
+        "⚠️ Чем точнее формат — тем лучше ИИ разберёт план.",
+        reply_markup=back_reply_keyboard()
     )
     nav_push(callback.from_user.id, "wp_manual")
     await callback.answer()
@@ -4636,9 +4635,9 @@ async def wp_choose_days(callback: CallbackQuery, bot: Bot, state: FSMContext):
         "Есть пожелания или особенности?\n\n"
         "Например: «травма колена», «нет штанги», «только утром»\n"
         "Или нажми Пропустить:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=with_back_kb([
             [InlineKeyboardButton(text="Пропустить →", callback_data="wp_notes_skip")]
-        ])
+        ]))
     )
     nav_push(callback.from_user.id, "wp_notes")
     await callback.answer()
@@ -4750,7 +4749,8 @@ async def wp_plan_edit_start(callback: CallbackQuery, bot: Bot, state: FSMContex
     await callback.message.edit_text(
         "Что хочешь изменить в плане?\n\nНапиши например:\n"
         "«убери приседания, замени на жим ногами»\n"
-        "«добавь кардио в пятницу»"
+        "«добавь кардио в пятницу»",
+        reply_markup=back_reply_keyboard()
     )
     nav_push(callback.from_user.id, "wp_edit")
     await callback.answer()
@@ -4850,9 +4850,9 @@ async def wp_plan_edit_input(message: Message, bot: Bot, state: FSMContext):
         except asyncio.CancelledError:
             pass
     if not new_plan:
-        back_to_workout_kb = InlineKeyboardMarkup(inline_keyboard=[
+        back_to_workout_kb = InlineKeyboardMarkup(inline_keyboard=with_back_kb([
             [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="wp_edit_retry")]
-        ])
+        ]))
         try:
             await bot.edit_message_text(
                 "Не удалось применить изменения. Попробуй сформулировать иначе.",
@@ -4956,10 +4956,10 @@ async def wp_manual_input(message: Message, bot: Bot, state: FSMContext):
         try:
             err_msg = await message.answer(
                 "❌ Не смог разобрать план. Можно скинуть тот же текст — я попробую снова.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=with_back_kb([
                     [InlineKeyboardButton(text="🔄 Попробовать снова",
                                           callback_data="retry_ai:manual_plan")]
-                ])
+                ]))
             )
             user_temp_messages.setdefault(user_id, {})['workout_error'] = err_msg.message_id
         except Exception as e:
@@ -5584,7 +5584,8 @@ async def workout_edit_plan_msg(callback: CallbackQuery, bot: Bot, state: FSMCon
     temps = user_temp_messages.get(user_id, {})
     await delete_message_safe(bot, callback.message.chat.id, temps.pop('workout_menu', None))
     msg = await callback.message.answer(
-        "Что изменить в плане?\n\nНапример:\n«убери приседания, замени на жим ногами»\n«добавь кардио в пятницу»"
+        "Что изменить в плане?\n\nНапример:\n«убери приседания, замени на жим ногами»\n«добавь кардио в пятницу»",
+        reply_markup=back_reply_keyboard()
     )
     user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
     nav_push(user_id, "wp_edit")
@@ -5639,7 +5640,8 @@ async def workout_new_category(callback: CallbackQuery, bot: Bot, state: FSMCont
     await callback.message.delete()
     await state.set_state(WorkoutState.creating_category)
     msg = await callback.message.answer(
-        "Введи название новой категории (например, 'Грудь', 'Кардио'):"
+        "Введи название новой категории (например, 'Грудь', 'Кардио'):",
+        reply_markup=back_reply_keyboard()
     )
     user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
     await callback.answer()
@@ -5657,10 +5659,10 @@ async def workout_create_category(message: Message, bot: Bot, state: FSMContext)
     await state.update_data(new_cat_name=cat_name)
     msg = await message.answer(
         f"Тип категории «{cat_name}»:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=with_back_kb([
             [InlineKeyboardButton(text="💪 Силовая", callback_data="cat_type_strength")],
             [InlineKeyboardButton(text="🚴 Кардио", callback_data="cat_type_cardio")],
-        ])
+        ]))
     )
     user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
@@ -5720,7 +5722,8 @@ async def workout_rename_category(callback: CallbackQuery, bot: Bot, state: FSMC
     await state.update_data(renaming_cat_id=cat_id)
     await callback.message.delete()
     await state.set_state(WorkoutState.renaming_category)
-    msg = await callback.message.answer("Введи новое название для категории:")
+    msg = await callback.message.answer("Введи новое название для категории:",
+                                         reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
@@ -5756,10 +5759,10 @@ async def workout_delete_category_confirm(callback: CallbackQuery, bot: Bot, sta
     await state.set_state(WorkoutState.deleting_category_confirm)
     msg = await callback.message.answer(
         "⚠️ Ты уверен, что хочешь удалить эту категорию? Все упражнения внутри тоже будут удалены.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=with_back_kb([
             [InlineKeyboardButton(text="✅ Да, удалить", callback_data="w_cat_delete_yes"),
              InlineKeyboardButton(text="❌ Нет", callback_data="workout_manage")]
-        ])
+        ]))
     )
     user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
@@ -5869,7 +5872,8 @@ async def workout_new_exercise(callback: CallbackQuery, bot: Bot, state: FSMCont
     await state.update_data(category_id=cat_id)
     await callback.message.delete()
     await state.set_state(WorkoutState.creating_exercise)
-    msg = await callback.message.answer("Введи название нового упражнения (например, 'Жим лёжа', 'Бег'):")
+    msg = await callback.message.answer("Введи название нового упражнения (например, 'Жим лёжа', 'Бег'):",
+                                         reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
@@ -5914,7 +5918,8 @@ async def set_goal_strength(callback: CallbackQuery, bot: Bot, state: FSMContext
     await state.set_state(WorkoutState.setting_strength_goal)
     msg = await callback.message.answer(
         "Введи цель для силового упражнения в формате: подходы x повторения (например, 3x10)\n"
-        "Если хочешь указать целевой вес и шаг увеличения, добавь ещё два числа через пробел: 3x10 50 2.5"
+        "Если хочешь указать целевой вес и шаг увеличения, добавь ещё два числа через пробел: 3x10 50 2.5",
+        reply_markup=back_reply_keyboard()
     )
     user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
@@ -5977,7 +5982,8 @@ async def set_goal_cardio(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.message.delete()
     await state.set_state(WorkoutState.setting_cardio_goal)
     msg = await callback.message.answer(
-        "Введи цель для кардио в формате: дистанция км / время мин (например, 5 30)"
+        "Введи цель для кардио в формате: дистанция км / время мин (например, 5 30)",
+        reply_markup=back_reply_keyboard()
     )
     user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
@@ -6052,7 +6058,8 @@ async def workout_rename_exercise(callback: CallbackQuery, bot: Bot, state: FSMC
     await state.update_data(renaming_ex_id=ex_id)
     await callback.message.delete()
     await state.set_state(WorkoutState.renaming_exercise)
-    msg = await callback.message.answer("Введи новое название для категории:")
+    msg = await callback.message.answer("Введи новое название для категории:",
+                                         reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
 
@@ -6094,10 +6101,9 @@ async def workout_delete_exercise_confirm(callback: CallbackQuery, bot: Bot, sta
     await state.set_state(WorkoutState.deleting_exercise_confirm)
     msg = await callback.message.answer(
         "⚠️ Ты уверен, что хочешь удалить это упражнение?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, удалить", callback_data="w_ex_delete_yes"),
-             InlineKeyboardButton(text="❌ Нет", callback_data="workout_manage")]
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=with_back_kb([
+            [InlineKeyboardButton(text="Пропустить →", callback_data="wp_notes_skip")]
+        ]))
     )
     user_temp_messages.setdefault(callback.from_user.id, {})['workout_temp'] = msg.message_id
     await callback.answer()
@@ -6197,7 +6203,7 @@ async def show_workout_history_page(user_id: int, chat_id: int, bot: Bot, page: 
     if nav:
         kb_rows.append(nav)
     kb_rows.append([InlineKeyboardButton(text=f"{total - page}/{total}", callback_data="wh_noop")])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    kb = InlineKeyboardMarkup(inline_keyboard=with_back_kb(kb_rows))
     if edit_msg_id:
         try:
             await bot.edit_message_text(text, chat_id, edit_msg_id, reply_markup=kb)
@@ -6238,7 +6244,7 @@ async def workout_edit_exercise_start(message: Message, bot: Bot, state: FSMCont
                 )])
     temps = user_temp_messages.get(user_id, {})
     await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
-    msg = await message.answer("Выбери день тренировки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await message.answer("Выбери день тренировки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons)))
     user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
     nav_push(user_id, "wex_days")
     await state.set_state(AIPlanState.editing_plan)
@@ -6270,7 +6276,7 @@ async def workout_edit_choose_day(callback: CallbackQuery, bot: Bot, state: FSMC
     for i, ex in enumerate(exercises):
         name = ex.get("exercise", ex.get("name", f"Упражнение {i+1}"))
         buttons.append([InlineKeyboardButton(text=name, callback_data=f"wex_ex_{i}")])
-    await callback.message.edit_text("Выбери упражнение для замены:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("Выбери упражнение для замены:", reply_markup=InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons)))
     nav_push(callback.from_user.id, "wex_ex")
     await callback.answer()
 
@@ -6294,7 +6300,7 @@ async def workout_edit_back_to_days(callback: CallbackQuery, bot: Bot, state: FS
             if day_key in week and day_key not in seen_days:
                 seen_days.add(day_key)
                 buttons.append([InlineKeyboardButton(text=day_names[day_key], callback_data=f"wex_day_{day_key}")])
-    await callback.message.edit_text("Выбери день тренировки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("Выбери день тренировки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=with_back_kb(buttons)))
     nav_push(callback.from_user.id, "wex_days")
     await callback.answer()
 
@@ -6425,7 +6431,7 @@ async def show_history_page(user_id: int, chat_id: int, bot: Bot, state: FSMCont
     if nav_buttons:
         keyboard_buttons.append(nav_buttons)
 
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=with_back_kb(keyboard_buttons))
 
     if edit_message_id:
         await bot.edit_message_text(text, chat_id, edit_message_id, reply_markup=reply_markup)
@@ -6586,7 +6592,8 @@ async def handle_diet(callback: CallbackQuery, bot: Bot, state: FSMContext):
     if not profile:
         await state.set_state(DietState.weight)
         await delete_temp_messages(bot, user_id, callback.message.chat.id, keep_ai=True)
-        msg = await callback.message.answer("📝 Введи свой вес (в кг):")
+        msg = await callback.message.answer("📝 Введи свой вес (в кг):",
+                                             reply_markup=back_reply_keyboard())
         user_temp_messages.setdefault(user_id, {})['diet_setup'] = msg.message_id
         await callback.answer()
         return
@@ -6996,7 +7003,8 @@ async def save_food_skip(callback: CallbackQuery, bot: Bot, state: FSMContext):
 @router.callback_query(DietState.new_food_name, F.data == "save_food_yes")
 async def save_food_yes_prompt(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.message.delete()
-    msg = await callback.message.answer("Введи название блюда для сохранения:")
+    msg = await callback.message.answer("Введи название блюда для сохранения:",
+                                         reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
     await state.update_data(awaiting_food_name_input=True)
     await callback.answer()
@@ -7042,7 +7050,8 @@ async def diet_log_weight_reply(callback: CallbackQuery, bot: Bot, state: FSMCon
     await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
     await state.clear()
     await state.set_state(DietState.log_weight)
-    msg = await callback.message.answer("⚖️ Введи свой текущий вес (в кг):")
+    msg = await callback.message.answer("⚖️ Введи свой текущий вес (в кг):",
+                                         reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
     await callback.answer()
 
@@ -7113,7 +7122,7 @@ async def diet_body_fat_reply(callback: CallbackQuery, bot: Bot, state: FSMConte
         "Пример для женщины: 165 60 38 70 95"
     )
     await state.set_state(DietState.body_fat_measurements)
-    msg = await callback.message.answer(instructions)
+    msg = await callback.message.answer(instructions, reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
     await callback.answer()
 
@@ -7256,7 +7265,7 @@ async def show_food_history_page(user_id: int, chat_id: int, bot: Bot, state: FS
     if nav_buttons:
         keyboard_buttons.append(nav_buttons)
 
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=with_back_kb(keyboard_buttons))
 
     if edit_message_id:
         await bot.edit_message_text(text, chat_id, edit_message_id, reply_markup=reply_markup)
@@ -7347,7 +7356,8 @@ async def diet_change_goal_reply(callback: CallbackQuery, bot: Bot, state: FSMCo
     await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
     await state.clear()
     await state.set_state(DietState.weight)
-    msg = await callback.message.answer("📝 Введи свой вес (в кг):")
+    msg = await callback.message.answer("📝 Введи свой вес (в кг):",
+                                         reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(callback.from_user.id, {})['diet_setup'] = msg.message_id
     await callback.answer()
 
@@ -7370,7 +7380,8 @@ async def diet_step_weight(message: Message, bot: Bot, state: FSMContext):
     await delete_message_safe(bot, message.chat.id, temps.get('diet_setup'))
     await state.update_data(weight=weight)
     await state.set_state(DietState.height)
-    msg = await message.answer("📝 Введи свой рост (в см):")
+    msg = await message.answer("📝 Введи свой рост (в см):",
+                                reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
 
 @router.message(DietState.height)
@@ -7390,7 +7401,8 @@ async def diet_step_height(message: Message, bot: Bot, state: FSMContext):
     await delete_message_safe(bot, message.chat.id, temps.get('diet_setup'))
     await state.update_data(height=height)
     await state.set_state(DietState.age)
-    msg = await message.answer("📝 Введи свой возраст (лет):")
+    msg = await message.answer("📝 Введи свой возраст (лет):",
+                                reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
 
 @router.message(DietState.age)
@@ -7450,7 +7462,8 @@ async def diet_step_goal(callback: CallbackQuery, bot: Bot, state: FSMContext):
     else:
         await state.set_state(DietState.target_weight)
         direction = "сбросить" if goal_type == "loss" else "набрать"
-        msg = await callback.message.answer(f"⚖️ Сколько кг хочешь {direction}? (например, 5):")
+        msg = await callback.message.answer(f"⚖️ Сколько кг хочешь {direction}? (например, 5):",
+                                             reply_markup=back_reply_keyboard())
         user_temp_messages.setdefault(callback.from_user.id, {})['diet_setup'] = msg.message_id
     await callback.answer()
 
@@ -7471,7 +7484,8 @@ async def diet_step_target_weight(message: Message, bot: Bot, state: FSMContext)
     await delete_message_safe(bot, message.chat.id, temps.get('diet_setup'))
     await state.update_data(target_weight_change=change)
     await state.set_state(DietState.target_days)
-    msg = await message.answer("📅 За сколько дней хочешь достичь цели? (например, 90):")
+    msg = await message.answer("📅 За сколько дней хочешь достичь цели? (например, 90):",
+                                reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
 
 @router.message(DietState.target_days)
@@ -7558,7 +7572,8 @@ async def diet_step_restart(callback: CallbackQuery, bot: Bot, state: FSMContext
     await callback.message.delete()
     await state.clear()
     await state.set_state(DietState.weight)
-    msg = await callback.message.answer("📝 Введи свой вес (в кг):")
+    msg = await callback.message.answer("📝 Введи свой вес (в кг):",
+                                         reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(user_id, {})['diet_setup'] = msg.message_id
     await callback.answer()
 
@@ -7669,7 +7684,8 @@ async def task_delete(callback: CallbackQuery, bot: Bot, state: FSMContext):
 async def task_new_start(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.message.delete()
     await state.set_state(TaskState.entering_title)
-    msg = await callback.message.answer("📝 Введи название задачи:")
+    msg = await callback.message.answer("📝 Введи название задачи:",
+                                         reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(callback.from_user.id, {})['task_create'] = msg.message_id
     await callback.answer()
 
@@ -7750,7 +7766,8 @@ async def task_choose_deadline(callback: CallbackQuery, bot: Bot, state: FSMCont
     await callback.message.delete()
     if callback.data == "task_deadline_yes":
         await state.set_state(TaskState.entering_deadline)
-        msg = await callback.message.answer("📅 Введи дату дедлайна в формате ДД.ММ.ГГГГ:")
+        msg = await callback.message.answer("📅 Введи дату дедлайна в формате ДД.ММ.ГГГГ:",
+                                             reply_markup=back_reply_keyboard())
         user_temp_messages.setdefault(callback.from_user.id, {})['task_create'] = msg.message_id
     else:
         await state.update_data(deadline=None)
@@ -7940,7 +7957,8 @@ async def _show_rank(user_id: int, chat_id: int, bot: Bot, state: FSMContext):
 
 <i>{get_rank_motivation(rank_id)}</i>"""
     await delete_temp_messages(bot, user_id, chat_id, keep_ai=True)
-    msg = await bot.send_message(chat_id, text, parse_mode="HTML")
+    msg = await bot.send_message(chat_id, text, parse_mode="HTML",
+                                 reply_markup=back_reply_keyboard())
     user_temp_messages.setdefault(user_id, {})['rank'] = msg.message_id
     nav_push(user_id, "rank")
 
@@ -8029,6 +8047,14 @@ def generate_weekly_report(user_id: int) -> str:
 async def _screen_send(bot, user_id, chat_id, text, keyboard, temps_key):
     temps = user_temp_messages.get(user_id, {})
     await delete_message_safe(bot, chat_id, temps.get(temps_key))
+    # Гарантируем кнопку «Назад» под любым экраном: если клавиатуры нет —
+    # ставим только «Назад», если есть — дописываем строку с «Назад».
+    if keyboard is None:
+        keyboard = back_reply_keyboard()
+    else:
+        rows = getattr(keyboard, "inline_keyboard", None)
+        if rows is not None:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=with_back_kb(rows))
     msg = await bot.send_message(chat_id, text, reply_markup=keyboard)
     temps[temps_key] = msg.message_id
     user_temp_messages[user_id] = temps
@@ -8120,9 +8146,9 @@ async def _screen_wp_notes(bot, user_id, chat_id, state):
     await _screen_send(bot, user_id, chat_id,
                        "Есть пожелания или особенности?\n\n"
                        "Например: «травма колена», «нет штанги», «только утром»\nИли нажми Пропустить:",
-                       InlineKeyboardMarkup(inline_keyboard=[
+                       InlineKeyboardMarkup(inline_keyboard=with_back_kb([
                            [InlineKeyboardButton(text="Пропустить →", callback_data="wp_notes_skip")]
-                       ]), 'workout_menu')
+                       ])), 'workout_menu')
     nav_push(user_id, "wp_notes")
 
 async def _screen_wp_review(bot, user_id, chat_id, state):
