@@ -20,8 +20,8 @@ from aiogram import F
 from PIL import Image
 from aiogram.filters import StateFilter
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, ReplyKeyboardMarkup, KeyboardButton
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, ReplyKeyboardMarkup, KeyboardButton, TelegramObject
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -158,6 +158,34 @@ async def ensure_back_keyboard(bot: Bot, chat_id: int, user_id: int):
         user_back_kb[user_id] = msg.message_id
     except Exception as e:
         print(f"[NAV] Не удалось отправить reply-клавиатуру: {e}")
+
+class BackKeyboardMiddleware(BaseMiddleware):
+    """До этого ensure_back_keyboard() вызывался только из send_main_menu,
+    поэтому кнопка «Назад» появлялась только у тех, кто уже побывал в главном
+    меню - множество экранов (рефлексия, диета, тренировки, задачи и т.д.)
+    открываются напрямую по инлайн-кнопкам и never проходили через send_main_menu.
+    Эта миддлварь проверяет/отправляет клавиатуру перед КАЖДЫМ действием
+    пользователя, так что кнопка гарантированно появится независимо от того,
+    через какой экран пользователь впервые зашёл. ensure_back_keyboard сама
+    по себе - no-op после первого раза (просто проверка словаря), так что
+    накладные расходы на каждое сообщение минимальны."""
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        bot = data.get('bot')
+        user = getattr(event, 'from_user', None)
+        chat = getattr(event, 'chat', None)
+        if chat is None:
+            message = getattr(event, 'message', None)
+            if message is not None:
+                chat = message.chat
+        if bot and user and chat:
+            try:
+                await ensure_back_keyboard(bot, chat.id, user.id)
+            except Exception as e:
+                print(f"[NAV] Ошибка в BackKeyboardMiddleware: {e}")
+        return await handler(event, data)
+
+router.message.outer_middleware(BackKeyboardMiddleware())
+router.callback_query.outer_middleware(BackKeyboardMiddleware())
 
 def nav_push(user_id: int, screen: str):
     """Отметить, что сейчас показан этот экран (для последующего «Назад»)."""
@@ -7780,6 +7808,47 @@ async def _show_stats_choice(user_id: int, chat_id: int, bot: Bot, state: FSMCon
     msg = await bot.send_message(chat_id, "📊 Выбери тип статистики:", reply_markup=stats_keyboard())
     user_temp_messages.setdefault(user_id, {})['stats_choice'] = msg.message_id
     nav_push(user_id, "stats")
+
+def create_line_chart(daily_data: list, user_id: int, days: int = 7) -> str:
+    """Строит линейный график динамики оценок рефлексии по категориям за период
+    (данные из get_daily_ratings: строки day_date/category/rating) и сохраняет
+    как PNG. Возвращает путь к файлу — вызывающий код сам удаляет его после
+    отправки, как и другие графики в этом файле (см. diet_chart_*)."""
+    by_category = defaultdict(dict)
+    seen_dates = set()
+    all_dates = []
+    for row in daily_data:
+        date_str, category, rating = row[0], row[1], row[2]
+        by_category[category][date_str] = rating
+        if date_str not in seen_dates:
+            seen_dates.add(date_str)
+            all_dates.append(date_str)
+    all_dates.sort()
+    x_labels = [datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m') for d in all_dates]
+
+    category_labels = {
+        'сон': '😴 Сон', 'еда': '🍽 Еда', 'активность': '💪 Активность',
+        'зависание': '🎮 Зависание', 'настрой': '🎯 Настрой',
+    }
+
+    fig = go.Figure()
+    for cat in ('сон', 'еда', 'активность', 'зависание', 'настрой'):
+        if cat not in by_category:
+            continue
+        y = [by_category[cat].get(d) for d in all_dates]
+        fig.add_trace(go.Scatter(
+            x=x_labels, y=y, mode='lines+markers',
+            name=category_labels.get(cat, cat), connectgaps=False
+        ))
+    fig.update_layout(
+        title=f"Динамика рефлексии за {'неделю' if days <= 7 else 'месяц'}",
+        yaxis=dict(range=[0, 10.5], title="Оценка"),
+        height=500, template='plotly_dark'
+    )
+
+    chart_path = f"reflection_chart_{user_id}.png"
+    fig.write_image(chart_path, scale=2)
+    return chart_path
 
 @router.callback_query(F.data == "menu_stats")
 async def handle_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
