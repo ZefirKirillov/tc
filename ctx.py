@@ -586,16 +586,14 @@ def analyze_food_photo(image_bytes: bytes, prompt: str) -> Optional[str]:
         return None
 
 def photo_analysis_cancel_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
-        resize_keyboard=True, one_time_keyboard=False
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="photo_analysis_cancel")]
+    ])
 
 def photo_analysis_back_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔙 Назад в меню")]],
-        resize_keyboard=True, one_time_keyboard=False
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="photo_analysis_back")]
+    ])
 
 @router.message(F.text == "🤳 Анализ фото")
 async def handle_photo_analysis_start(message: Message, bot: Bot, state: FSMContext):
@@ -691,18 +689,35 @@ async def analyze_photo(message: Message, bot: Bot, state: FSMContext):
     user_temp_messages.setdefault(user_id, {})['photo_analysis_result'] = result_msg.message_id
     await state.clear()
 
-@router.message(StateFilter("waiting_for_photo"), F.text == "❌ Отмена")
-async def photo_analysis_cancel(message: Message, bot: Bot, state: FSMContext):
-    user_id = message.from_user.id
+@router.callback_query(F.data == "photo_analysis_cancel", StateFilter("waiting_for_photo"))
+async def photo_analysis_cancel(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = callback.from_user.id
     temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, message.chat.id, temps.get('photo_intro'))
+    await delete_message_safe(bot, callback.message.chat.id, temps.get('photo_intro'))
     # НЕ удаляем фото пользователя и анализ ИИ при отмене
     await state.clear()
-    await show_workout_main_menu(user_id, message.chat.id, bot)
+    await show_workout_main_menu(user_id, callback.message.chat.id, bot)
     try:
-        await message.delete()
+        await callback.message.delete()
     except:
         pass
+    await callback.answer()
+
+@router.callback_query(F.data == "photo_analysis_back")
+async def photo_analysis_back(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = callback.from_user.id
+    await delete_temp_messages(bot, user_id, callback.message.chat.id, keep_ai=True)
+    # Убираем инлайн кнопки у сохранённых сообщений (включая сам результат анализа)
+    temps = user_temp_messages.get(user_id, {})
+    for key in ['photo_analysis_result', 'photo_user', 'body_fat_measurements', 'body_fat_result']:
+        if key in temps:
+            try:
+                await bot.edit_message_reply_markup(callback.message.chat.id, temps[key])
+            except:
+                pass
+    await state.clear()
+    await send_main_menu(bot, user_id, callback.message.chat.id)
+    await callback.answer()
 
 @router.message(StateFilter("waiting_for_photo"), F.text)
 async def photo_timeout(message: Message, bot: Bot, state: FSMContext):
@@ -2416,13 +2431,10 @@ def rating_keyboard():
     return keyboard
 
 def ai_reply_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="💡 Дай мне совет")],
-            [KeyboardButton(text="🔙 Назад в меню")]
-        ],
-        resize_keyboard=True, one_time_keyboard=False
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💡 Дай мне совет", callback_data="ai_advice")],
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
+    ])
 
 def low_rating_keyboard(category: str):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2986,15 +2998,13 @@ def diet_menu_reply_keyboard():
     return keyboard
 
 def meal_type_keyboard():
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🍳 Завтрак"), KeyboardButton(text="🥗 Обед")],
-            [KeyboardButton(text="🍽 Ужин"), KeyboardButton(text="🍪 Перекус")],
-            [KeyboardButton(text="🔙 Отмена")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍳 Завтрак", callback_data="meal_type:Завтрак"),
+         InlineKeyboardButton(text="🥗 Обед", callback_data="meal_type:Обед")],
+        [InlineKeyboardButton(text="🍽 Ужин", callback_data="meal_type:Ужин"),
+         InlineKeyboardButton(text="🍪 Перекус", callback_data="meal_type:Перекус")],
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="meal_entry_cancel")]
+    ])
     return keyboard
 
 def meal_chosen_keyboard():
@@ -3531,14 +3541,24 @@ async def handle_mood_category(message: Message, bot: Bot, state: FSMContext):
     await state.set_state(RatingState.waiting_for_mood_text)
     msg = await message.answer(
         "🎯 Опиши в паре предложений, как прошёл твой день и что ты сегодня чувствовал(а):",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Назад")]],
-                                          resize_keyboard=True)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="mood_back")]
+        ])
     )
     temps['rating'] = msg.message_id
     user_temp_messages[user_id] = temps
 
+@router.callback_query(RatingState.waiting_for_mood_text, F.data == "mood_back")
+async def mood_back(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = callback.from_user.id
+    temps = user_temp_messages.get(user_id, {})
+    await delete_message_safe(bot, callback.message.chat.id, temps.get('rating'))
+    await show_reflection_menu(user_id, callback.message.chat.id, bot, state, callback.from_user.first_name)
+    await callback.answer()
+
 @router.message(RatingState.waiting_for_mood_text)
 async def process_mood_text(message: Message, bot: Bot, state: FSMContext):
+    # На случай, если пользователь нажмёт reply-кнопку «🔙 Назад» меню рефлексии
     if message.text == "🔙 Назад":
         try:
             await message.delete()
@@ -3809,18 +3829,14 @@ async def wp_edit_retry(callback: CallbackQuery, bot: Bot, state: FSMContext):
     )
     await callback.answer()
 
-@router.message(F.text == "💡 Дай мне совет")
-async def handle_ai_advice(message: Message, bot: Bot, state: FSMContext):
-    user_id = message.from_user.id
-    try:
-        await message.delete()
-    except:
-        pass
+@router.callback_query(F.data == "ai_advice")
+async def handle_ai_advice(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = callback.from_user.id
     temps = user_temp_messages.get(user_id, {})
     # Удаляем вступительное сообщение бота (если ещё не удалено)
-    await delete_message_safe(bot, message.chat.id, temps.get('ai_advisor'))
-    await bot.send_chat_action(message.chat.id, action=ChatAction.TYPING)
-    name = get_user_name(user_id, message.from_user.first_name)
+    await delete_message_safe(bot, callback.message.chat.id, temps.get('ai_advisor'))
+    await bot.send_chat_action(callback.message.chat.id, action=ChatAction.TYPING)
+    name = get_user_name(user_id, callback.from_user.first_name)
     full_context = get_full_context_for_ai(user_id)
     prompt = f"""Ты — персональный трекер-ассистент. Пользователь {name}.
 
@@ -3833,7 +3849,7 @@ async def handle_ai_advice(message: Message, bot: Bot, state: FSMContext):
     # Animation while generating
     phrases_ai = ["Думаю.", "Думаю..", "Думаю...", "Анализирую.", "Анализирую..", "Анализирую..."]
     stop_ai = asyncio.Event()
-    tmp = await message.answer("Думаю...")
+    tmp = await callback.message.answer("Думаю...")
     ai_msg_id = tmp.message_id
     temps['ai_advisor'] = ai_msg_id
     user_temp_messages[user_id] = temps
@@ -3843,7 +3859,7 @@ async def handle_ai_advice(message: Message, bot: Bot, state: FSMContext):
         while not stop_ai.is_set():
             try:
                 await bot.edit_message_text(phrases_ai[i % len(phrases_ai)],
-                                             message.chat.id, ai_msg_id)
+                                             callback.message.chat.id, ai_msg_id)
             except:
                 pass
             await asyncio.sleep(1)
@@ -3860,30 +3876,32 @@ async def handle_ai_advice(message: Message, bot: Bot, state: FSMContext):
             pass
     if answer.startswith("❌"):
         try:
-            await bot.edit_message_text("❌ ИИ не ответил.", message.chat.id, ai_msg_id)
+            await bot.edit_message_text("❌ ИИ не ответил.", callback.message.chat.id, ai_msg_id)
         except:
             pass
-        await message.answer(
+        await callback.message.answer(
             "❌ ИИ не ответил. Нажми кнопку чтобы попробовать ещё раз.",
             reply_markup=retry_ai_keyboard("ai_advice")
         )
         await state.set_state(AIAdvisorState.waiting_for_question)
+        await callback.answer()
         return
     try:
         await bot.edit_message_text(
             f"💡 <b>Совет:</b>\n\n{answer}",
-            message.chat.id, ai_msg_id,
+            callback.message.chat.id, ai_msg_id,
             parse_mode="HTML", reply_markup=ai_reply_keyboard()
         )
     except Exception:
-        await delete_message_safe(bot, message.chat.id, ai_msg_id)
-        msg = await message.answer(f"💡 <b>Совет:</b>\n\n{answer}",
-                                    parse_mode="HTML", reply_markup=ai_reply_keyboard())
+        await delete_message_safe(bot, callback.message.chat.id, ai_msg_id)
+        msg = await callback.message.answer(f"💡 <b>Совет:</b>\n\n{answer}",
+                                            parse_mode="HTML", reply_markup=ai_reply_keyboard())
         ai_msg_id = msg.message_id
     temps['ai_response'] = ai_msg_id
     user_temp_messages[user_id] = temps
     save_last_ai_answer(user_id, answer)
     await state.set_state(AIAdvisorState.waiting_for_question)
+    await callback.answer()
 
 @router.message(AIAdvisorState.waiting_for_question)
 async def process_ai_question(message: Message, bot: Bot, state: FSMContext):
@@ -6717,34 +6735,31 @@ async def diet_log_food_reply(message: Message, bot: Bot, state: FSMContext):
     msg = await message.answer("Выбери приём пищи:", reply_markup=meal_type_keyboard())
     user_temp_messages.setdefault(user_id, {})['diet_temp'] = msg.message_id
 
-@router.message(DietState.meal_type, F.text.in_(["🍳 Завтрак", "🥗 Обед", "🍽 Ужин", "🍪 Перекус"]))
-async def diet_choose_meal(message: Message, bot: Bot, state: FSMContext):
+@router.callback_query(DietState.meal_type, F.data.startswith("meal_type:"))
+async def diet_choose_meal(callback: CallbackQuery, bot: Bot, state: FSMContext):
     meal_map = {
-        "🍳 Завтрак": "Завтрак",
-        "🥗 Обед": "Обед",
-        "🍽 Ужин": "Ужин",
-        "🍪 Перекус": "Перекус"
+        "Завтрак": "Завтрак",
+        "Обед": "Обед",
+        "Ужин": "Ужин",
+        "Перекус": "Перекус"
     }
-    meal_type = meal_map[message.text]
+    meal_type = meal_map.get(callback.data.split(":", 1)[1])
+    if not meal_type:
+        await callback.answer()
+        return
     await state.update_data(meal_type=meal_type)
 
-    temps = user_temp_messages.get(message.from_user.id, {})
-    await delete_message_safe(bot, message.chat.id, message.message_id)
-    await delete_message_safe(bot, message.chat.id, temps.get('diet_temp'))
+    temps = user_temp_messages.get(callback.from_user.id, {})
+    await delete_message_safe(bot, callback.message.chat.id, temps.get('diet_temp'))
 
-    msg = await message.answer(
-        f"Приём пищи: <b>{meal_map[message.text]}</b>\n\n"
+    msg = await callback.message.answer(
+        f"Приём пищи: <b>{meal_type}</b>\n\n"
         "Опиши что съел — ИИ посчитает калории, или запиши вручную:",
         parse_mode="HTML",
         reply_markup=meal_chosen_keyboard()
     )
-    user_temp_messages.setdefault(message.from_user.id, {})['diet_temp'] = msg.message_id
-
-@router.message(DietState.meal_type, F.text == "🔙 Отмена")
-async def diet_cancel_meal(message: Message, bot: Bot, state: FSMContext):
-    await state.clear()
-    await delete_message_safe(bot, message.chat.id, message.message_id)
-    await show_diet_menu(message.from_user.id, message.chat.id, bot)
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
+    await callback.answer()
 
 @router.callback_query(DietState.meal_type, F.data == "meal_entry_manual")
 async def meal_entry_manual(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6769,7 +6784,7 @@ async def meal_entry_cancel(callback: CallbackQuery, bot: Bot, state: FSMContext
     await callback.answer()
     await show_diet_menu(user_id, callback.message.chat.id, bot)
 
-@router.message(DietState.meal_type, F.text & ~F.text.startswith("/") & ~F.text.in_(["🍳 Завтрак", "🥗 Обед", "🍽 Ужин", "🍪 Перекус", "🔙 Отмена"]))
+@router.message(DietState.meal_type, F.text & ~F.text.startswith("/"))
 async def meal_type_text_forward(message: Message, bot: Bot, state: FSMContext):
     """Пользователь написал описание еды прямо после выбора приёма пищи — переключаем стейт и обрабатываем."""
     await state.set_state(DietState.food_description)
