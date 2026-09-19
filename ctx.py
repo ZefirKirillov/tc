@@ -129,6 +129,56 @@ user_welcome_message: Dict[int, int] = {}
 scheduler = None
 bot_instance = None
 
+# ============ УНИВЕРСАЛЬНАЯ КНОПКА «НАЗАД» ============
+# Telegram разрешает прикрепить к сообщению либо inline-, либо reply-клавиатуру
+# (но не обе сразу). Поэтому навигационная «🔙 Назад» живёт на отдельной
+# постоянной reply-клавиатуре, а все остальные кнопки — inline.
+BACK_BUTTON_TEXT = "🔙 Назад"
+user_back_kb: Dict[int, int] = {}        # id сообщения-носителя reply-клавиатуры
+user_nav: Dict[int, List[str]] = {}      # стек экранов для кнопки «Назад»
+SCREEN_RENDER: Dict[str, Any] = {}       # имя экрана -> async fn(bot, user_id, chat_id, state)
+
+def back_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BACK_BUTTON_TEXT)]],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
+async def ensure_back_keyboard(bot: Bot, chat_id: int, user_id: int):
+    """Reply-клавиатуру нельзя повесить на сообщение с inline-кнопками,
+    поэтому отправляем её одним отдельным сообщением и никогда не удаляем."""
+    if user_id in user_back_kb:
+        return
+    try:
+        msg = await bot.send_message(
+            chat_id, "⬇️ Кнопка «Назад» всегда под рукой",
+            reply_markup=back_reply_keyboard()
+        )
+        user_back_kb[user_id] = msg.message_id
+    except Exception as e:
+        print(f"[NAV] Не удалось отправить reply-клавиатуру: {e}")
+
+def nav_push(user_id: int, screen: str):
+    """Отметить, что сейчас показан этот экран (для последующего «Назад»)."""
+    stack = user_nav.setdefault(user_id, [])
+    if not stack or stack[-1] != screen:
+        stack.append(screen)
+
+def nav_current(user_id: int) -> str:
+    stack = user_nav.get(user_id) or []
+    return stack[-1] if stack else "main"
+
+def nav_pop(user_id: int) -> str:
+    stack = user_nav.get(user_id)
+    if stack:
+        stack.pop()
+    return nav_current(user_id)
+
+async def render_screen(bot: Bot, user_id: int, chat_id: int, state: FSMContext, screen: str):
+    render = SCREEN_RENDER.get(screen) or SCREEN_RENDER.get("main")
+    await render(bot, user_id, chat_id, state)
+
 # ============ РАНГИ И ИСКРЫ ============
 RANKS = {
     1: {"name": "Первые Искры", "emoji": "✨", "sparks_needed": 1, "motivation": "Первый шаг сделан! Искра зажжена, путь начат!"},
@@ -591,24 +641,21 @@ def photo_analysis_cancel_keyboard():
     ])
 
 def photo_analysis_back_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="photo_analysis_back")]
-    ])
+    # Навигация — через универсальную reply-кнопку «🔙 Назад»
+    return None
 
-@router.message(F.text == "🤳 Анализ фото")
-async def handle_photo_analysis_start(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
+@router.callback_query(F.data == "menu_photo_analysis")
+async def handle_photo_analysis_start(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
     await state.clear()
-    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
-    intro_msg = await message.answer(
+    await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
+    intro_msg = await callback.message.answer(
         "📸 Отправь фото для анализа телосложения.\n\nИли нажми «❌ Отмена».",
         reply_markup=photo_analysis_cancel_keyboard()
     )
-    user_temp_messages.setdefault(message.from_user.id, {})['photo_intro'] = intro_msg.message_id
+    user_temp_messages.setdefault(callback.from_user.id, {})['photo_intro'] = intro_msg.message_id
     await state.set_state("waiting_for_photo")
+    await callback.answer()
 
 @router.message(F.photo, StateFilter("waiting_for_photo"))
 async def analyze_photo(message: Message, bot: Bot, state: FSMContext):
@@ -718,6 +765,23 @@ async def photo_analysis_back(callback: CallbackQuery, bot: Bot, state: FSMConte
     await state.clear()
     await send_main_menu(bot, user_id, callback.message.chat.id)
     await callback.answer()
+
+@router.message(F.text == BACK_BUTTON_TEXT)
+async def universal_back(message: Message, bot: Bot, state: FSMContext):
+    """Универсальная навигационная reply-кнопка: возвращает на один экран назад."""
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    user_id = message.from_user.id
+    screen = nav_pop(user_id)
+    # Экраны-шаги мастеров хранят данные в FSM — их не сбрасываем; для
+    # остальных экранов кнопка «Назад» заодно отменяет незавершённый ввод.
+    if screen not in {"wp_mode", "wp_goal", "wp_level", "wp_days", "wp_notes", "wp_review",
+                      "wp_edit", "wp_manual", "wex_days", "wex_ex", "wex_replace",
+                      "diet_meal", "ai"}:
+        await state.clear()
+    await render_screen(bot, user_id, message.chat.id, state, screen)
 
 @router.message(StateFilter("waiting_for_photo"), F.text)
 async def photo_timeout(message: Message, bot: Bot, state: FSMContext):
@@ -2400,28 +2464,21 @@ def init_db():
     
 # ============ КЛАВИАТУРЫ ============
 def main_menu_keyboard():
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📒 Рефлексия"), KeyboardButton(text="⭐ Ранг")],
-            [KeyboardButton(text="🏋️ Тренировки"), KeyboardButton(text="Check AI")],
-            [KeyboardButton(text="🍽 Диета"), KeyboardButton(text="📝 Задачи")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False
-    )
-    return keyboard
-    
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📒 Рефлексия", callback_data="menu_reflection"),
+         InlineKeyboardButton(text="⭐ Ранг", callback_data="menu_rank")],
+        [InlineKeyboardButton(text="🏋️ Тренировки", callback_data="menu_workouts"),
+         InlineKeyboardButton(text="Check AI", callback_data="menu_ai")],
+        [InlineKeyboardButton(text="🍽 Диета", callback_data="menu_diet"),
+         InlineKeyboardButton(text="📝 Задачи", callback_data="menu_tasks")]
+    ])
+
 def reflection_keyboard():
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="😴 Сон"), KeyboardButton(text="🎮 Зависание")],
-            [KeyboardButton(text="🎯 Настрой")],
-            [KeyboardButton(text="🔙 Назад")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False
-    )
-    return keyboard
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="😴 Сон", callback_data="refl:сон"),
+         InlineKeyboardButton(text="🎮 Зависание", callback_data="refl:зависание")],
+        [InlineKeyboardButton(text="🎯 Настрой", callback_data="refl:настрой")]
+    ])
 
 def rating_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2432,8 +2489,7 @@ def rating_keyboard():
 
 def ai_reply_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💡 Дай мне совет", callback_data="ai_advice")],
-        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
+        [InlineKeyboardButton(text="💡 Дай мне совет", callback_data="ai_advice")]
     ])
 
 def low_rating_keyboard(category: str):
@@ -2854,41 +2910,26 @@ async def _retry_monthly_review(callback, bot, state):
     for i, ch in enumerate(chg, 1):
         lines.append(f"{i}. {ch['old_exercise']} → {ch['new_exercise']}\n   {ch['reason']}")
     lines.append("\nНапиши номера изменений которые принять (например: 1 3) или «нет» чтобы отклонить всё:")
-    await callback.message.edit_text("\n".join(lines),
-                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                          [InlineKeyboardButton(text="🔙 Назад",
-                                                                 callback_data="wp_review_decline")]
-                                      ]))
+    await callback.message.edit_text("\n".join(lines))
+    nav_push(callback.from_user.id, "wp_review_decline_prompt")
 
 def workout_main_reply_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🏋️ Добавить выполнение"), KeyboardButton(text="🤳 Анализ фото")],
-            [KeyboardButton(text="📋 Управление"), KeyboardButton(text="📊 История")],
-            [KeyboardButton(text="🔙 Назад в меню")]
-        ],
-        resize_keyboard=True, one_time_keyboard=False
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏋️ Добавить выполнение", callback_data="menu_workout_add"),
+         InlineKeyboardButton(text="🤳 Анализ фото", callback_data="menu_photo_analysis")],
+        [InlineKeyboardButton(text="📋 Управление", callback_data="menu_workout_manage"),
+         InlineKeyboardButton(text="📊 История", callback_data="workout_history")]
+    ])
 
 def workout_manage_reply_keyboard(mode: str = "ai"):
     """Клавиатура управления планом."""
+    rows = [
+        [InlineKeyboardButton(text="🆕 Новый план (ИИ)", callback_data="wp_new_plan"),
+         InlineKeyboardButton(text="📝 Загрузить свой план", callback_data="wp_mode_manual")]
+    ]
     if mode == "ai":
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🆕 Новый план (ИИ)"), KeyboardButton(text="✏️ Редактировать план (ИИ)")],
-                [KeyboardButton(text="📝 Загрузить свой план")],
-                [KeyboardButton(text="🔙 Назад к тренировкам")]
-            ],
-            resize_keyboard=True, one_time_keyboard=False
-        )
-    # manual mode
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🆕 Новый план (ИИ)"), KeyboardButton(text="📝 Загрузить свой план")],
-            [KeyboardButton(text="🔙 Назад к тренировкам")]
-        ],
-        resize_keyboard=True, one_time_keyboard=False
-    )
+        rows.insert(0, [InlineKeyboardButton(text="✏️ Редактировать план (ИИ)", callback_data="wp_edit_plan")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def workout_main_keyboard():
     return workout_main_reply_keyboard()
@@ -2907,15 +2948,13 @@ def workout_categories_keyboard(categories: List[Tuple[int, str]], action: str =
             row = []
     if action == "manage":
         buttons.append([InlineKeyboardButton(text="➕ Создать категорию", callback_data="w_cat_new")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="workout_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def workout_category_actions_keyboard(cat_id: int):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Упражнения", callback_data=f"w_manage_exercises_{cat_id}")],
         [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"w_cat_rename_{cat_id}"),
-         InlineKeyboardButton(text="❌ Удалить", callback_data=f"w_cat_delete_{cat_id}")],
-        [InlineKeyboardButton(text="🔙 К списку категорий", callback_data="workout_manage")]
+         InlineKeyboardButton(text="❌ Удалить", callback_data=f"w_cat_delete_{cat_id}")]
     ])
     return keyboard
 
@@ -2933,15 +2972,13 @@ def workout_exercises_keyboard(exercises: List[Tuple[int, str]], cat_id: int, ac
             row = []
     if action == "manage":
         buttons.append([InlineKeyboardButton(text="➕ Создать упражнение", callback_data=f"w_ex_new_{cat_id}")])
-    buttons.append([InlineKeyboardButton(text="🔙 К категориям", callback_data="w_back_to_cats_from_ex")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def workout_exercise_actions_keyboard(ex_id: int):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"w_ex_rename_{ex_id}"),
          InlineKeyboardButton(text="❌ Удалить", callback_data=f"w_ex_delete_{ex_id}")],
-        [InlineKeyboardButton(text="🎯 Установить цель", callback_data=f"w_ex_set_goal_{ex_id}")],
-        [InlineKeyboardButton(text="🔙 К списку упражнений", callback_data="w_back_to_ex_from_actions")]
+        [InlineKeyboardButton(text="🎯 Установить цель", callback_data=f"w_ex_set_goal_{ex_id}")]
     ])
     return keyboard
 
@@ -2955,16 +2992,14 @@ def workout_continue_keyboard():
 def workout_exercise_goal_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Силовое", callback_data="goal_strength")],
-        [InlineKeyboardButton(text="🚴 Кардио", callback_data="goal_cardio")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="w_back_to_ex_from_actions")]
+        [InlineKeyboardButton(text="🚴 Кардио", callback_data="goal_cardio")]
     ])
     return keyboard
 
 def workout_action_choice_keyboard(ex_id: int):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Ввести вручную", callback_data=f"w_manual_{ex_id}")],
-        [InlineKeyboardButton(text="🎯 Цель достигнута", callback_data=f"w_achieve_goal_{ex_id}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="w_back_to_main_from_add")]
+        [InlineKeyboardButton(text="🎯 Цель достигнута", callback_data=f"w_achieve_goal_{ex_id}")]
     ])
     return keyboard
 
@@ -2973,29 +3008,23 @@ def stats_keyboard():
         [InlineKeyboardButton(text="📆 Неделя", callback_data="stats:week"),
          InlineKeyboardButton(text="🗓 Месяц", callback_data="stats:month")],
         [InlineKeyboardButton(text="📈 График неделя", callback_data="stats:chart_week"),
-         InlineKeyboardButton(text="📈 График месяц", callback_data="stats:chart_month")],
-        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
+         InlineKeyboardButton(text="📈 График месяц", callback_data="stats:chart_month")]
     ])
     return keyboard
 
 def rank_back_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
-    ])
-    return keyboard
+    # Навигация — через универсальную reply-кнопку «🔙 Назад»
+    return None
 
 def diet_menu_reply_keyboard():
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🍎 Записать еду"), KeyboardButton(text="⚖️ Записать вес")],
-            [KeyboardButton(text="🧮 Рассчитать % жира"), KeyboardButton(text="📖 История еды")],
-            [KeyboardButton(text="📈 Графики веса и % жира"), KeyboardButton(text="⚙️ Изменить цель")],
-            [KeyboardButton(text="🔙 Назад")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False
-    )
-    return keyboard
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍎 Записать еду", callback_data="diet_food"),
+         InlineKeyboardButton(text="⚖️ Записать вес", callback_data="diet_weight")],
+        [InlineKeyboardButton(text="🧮 Рассчитать % жира", callback_data="diet_bodyfat"),
+         InlineKeyboardButton(text="📖 История еды", callback_data="diet_food_history")],
+        [InlineKeyboardButton(text="📈 Графики веса и % жира", callback_data="diet_charts"),
+         InlineKeyboardButton(text="⚙️ Изменить цель", callback_data="diet_goal")]
+    ])
 
 def meal_type_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -3068,12 +3097,6 @@ def diet_confirm_food_keyboard():
     ])
     return keyboard
 
-def back_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
-    ])
-    return keyboard
-
 def food_add_more_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, добавить ещё", callback_data="food_add_more_yes")],
@@ -3114,7 +3137,6 @@ def tasks_menu_keyboard(tasks: list, user_id: Optional[int] = None) -> InlineKey
                 InlineKeyboardButton(text="🗑", callback_data=f"task_del_{t['id']}")
             ])
     buttons.append([InlineKeyboardButton(text="➕ Новая задача", callback_data="task_new")])
-    buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def tasks_confirm_keyboard(task_id: int) -> InlineKeyboardMarkup:
@@ -3171,8 +3193,7 @@ def urgent_tasks_keyboard(tasks: list, user_id: Optional[int] = None) -> Optiona
 def wp_mode_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 Создать план с ИИ", callback_data="wp_mode_ai")],
-        [InlineKeyboardButton(text="📝 Ввести свой план", callback_data="wp_mode_manual")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+        [InlineKeyboardButton(text="📝 Ввести свой план", callback_data="wp_mode_manual")]
     ])
 
 def wp_goal_keyboard():
@@ -3180,16 +3201,14 @@ def wp_goal_keyboard():
         [InlineKeyboardButton(text="💪 Набор массы", callback_data="wp_goal_mass")],
         [InlineKeyboardButton(text="🔥 Похудение", callback_data="wp_goal_loss")],
         [InlineKeyboardButton(text="⚡ Сила", callback_data="wp_goal_strength")],
-        [InlineKeyboardButton(text="🎯 Общая форма", callback_data="wp_goal_fitness")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="wp_back_to_mode")]
+        [InlineKeyboardButton(text="🎯 Общая форма", callback_data="wp_goal_fitness")]
     ])
 
 def wp_level_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌱 Новичок", callback_data="wp_level_beginner")],
         [InlineKeyboardButton(text="📈 Средний", callback_data="wp_level_intermediate")],
-        [InlineKeyboardButton(text="🏆 Продвинутый", callback_data="wp_level_advanced")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="wp_back_to_goal")]
+        [InlineKeyboardButton(text="🏆 Продвинутый", callback_data="wp_level_advanced")]
     ])
 
 def wp_days_keyboard():
@@ -3197,36 +3216,31 @@ def wp_days_keyboard():
         [InlineKeyboardButton(text="2", callback_data="wp_days_2"),
          InlineKeyboardButton(text="3", callback_data="wp_days_3"),
          InlineKeyboardButton(text="4", callback_data="wp_days_4"),
-         InlineKeyboardButton(text="5", callback_data="wp_days_5")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="wp_back_to_level")]
+         InlineKeyboardButton(text="5", callback_data="wp_days_5")]
     ])
 
 def wp_plan_review_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять план", callback_data="wp_plan_accept")],
         [InlineKeyboardButton(text="✏️ Редактировать", callback_data="wp_plan_edit")],
-        [InlineKeyboardButton(text="🔄 Сгенерировать заново", callback_data="wp_plan_regenerate")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="wp_back_to_days")]
+        [InlineKeyboardButton(text="🔄 Сгенерировать заново", callback_data="wp_plan_regenerate")]
     ])
 
 def wp_plan_review_keyboard_manual():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять план", callback_data="wp_plan_accept")],
         [InlineKeyboardButton(text="✏️ Редактировать", callback_data="wp_plan_edit")],
-        [InlineKeyboardButton(text="🔄 Ввести заново", callback_data="wp_mode_manual")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="wp_back_to_mode")]
+        [InlineKeyboardButton(text="🔄 Ввести заново", callback_data="wp_mode_manual")]
     ])
 
 def wp_edit_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад к плану", callback_data="wp_back_to_review")]
-    ])
+    # Навигация — через универсальную reply-кнопку «🔙 Назад»
+    return None
 
 def ws_today_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="ПОГНАЛИ 💪", callback_data="ws_start")],
-        [InlineKeyboardButton(text="Пропустил день", callback_data="ws_skip_day")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+        [InlineKeyboardButton(text="Пропустил день", callback_data="ws_skip_day")]
     ])
 
 def ws_exercise_keyboard(is_first: bool = True):
@@ -3235,24 +3249,21 @@ def ws_exercise_keyboard(is_first: bool = True):
         [InlineKeyboardButton(text="⏭ Пропустить", callback_data="ws_ex_skip")]
     ]
     if not is_first:
-        buttons.append([InlineKeyboardButton(text="↩️ Назад", callback_data="ws_ex_prev")])
+        buttons.append([InlineKeyboardButton(text="↩️ Предыдущее упражнение", callback_data="ws_ex_prev")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def ws_skip_day_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="ws_back_to_today")]
-    ])
+    # Навигация — через универсальную reply-кнопку «🔙 Назад»
+    return None
 
 def ws_rest_day_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад в меню тренировок", callback_data="back_to_workout_main")]
-    ])
+    # Навигация — через универсальную reply-кнопку «🔙 Назад»
+    return None
 
 def wp_settings_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить план", callback_data="wp_reset")],
-        [InlineKeyboardButton(text="📋 Пересмотр упражнений", callback_data="wp_monthly_review")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_main_ai")]
+        [InlineKeyboardButton(text="📋 Пересмотр упражнений", callback_data="wp_monthly_review")]
     ])
 
 def wp_monthly_review_keyboard(changes: list):
@@ -3264,13 +3275,11 @@ def wp_monthly_review_keyboard(changes: list):
         )])
     buttons.append([InlineKeyboardButton(text="✅ Принять выбранные", callback_data="wp_review_accept")])
     buttons.append([InlineKeyboardButton(text="❌ Отклонить всё", callback_data="wp_review_decline")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="workout_main_ai")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def workout_ai_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Настройки плана", callback_data="wp_settings")],
-        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
+        [InlineKeyboardButton(text="📋 Настройки плана", callback_data="wp_settings")]
     ])
 
 # ============ ФОРМИРОВАНИЕ МЕНЮ ============
@@ -3326,6 +3335,10 @@ def format_main_menu(user_id: int) -> str:
     return "\n".join(lines)
 
 async def send_main_menu(bot: Bot, user_id: int, chat_id: int):
+    # Reply-клавиатура с «🔙 Назад» не может жить на сообщении с inline-кнопками —
+    # держим её на отдельном постоянном сообщении.
+    await ensure_back_keyboard(bot, chat_id, user_id)
+    nav_push(user_id, "main")
     try:
         text = format_main_menu(user_id)
         old_menu = user_last_menu.get(user_id)
@@ -3496,76 +3509,47 @@ async def show_reflection_menu(user_id: int, chat_id: int, bot: Bot, state: FSMC
         await send_main_menu(bot, user_id, chat_id)
         return
     msg = await bot.send_message(chat_id, f"{name}, что оценим?", reply_markup=reflection_keyboard())
+    nav_push(user_id, "reflection")
     user_temp_messages[user_id]['reflection'] = msg.message_id
 
-@router.message(F.text == "📒 Рефлексия")
-async def handle_reflection(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    await show_reflection_menu(message.from_user.id, message.chat.id, bot, state, message.from_user.first_name)
+@router.callback_query(F.data == "menu_reflection")
+async def handle_reflection(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    await show_reflection_menu(callback.from_user.id, callback.message.chat.id, bot, state, callback.from_user.first_name)
+    await callback.answer()
 
 
-@router.message(F.text.in_(["😴 Сон", "🎮 Зависание"]))
-async def handle_category(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    text_to_category = {
-        "😴 Сон": "сон",
-        "🎮 Зависание": "зависание",
-    }
-    category = text_to_category.get(message.text)
-    if not category:
+@router.callback_query(F.data.startswith("refl:"))
+async def handle_category(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    category = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    if category == "настрой":
+        await callback.message.delete()
+        temps = user_temp_messages.get(user_id, {})
+        await delete_message_safe(bot, callback.message.chat.id, temps.get('reflection'))
+        await state.set_state(RatingState.waiting_for_mood_text)
+        msg = await callback.message.answer(
+            "🎯 Опиши в паре предложений, как прошёл твой день и что ты сегодня чувствовал(а):"
+        )
+        temps['rating'] = msg.message_id
+        user_temp_messages[user_id] = temps
+        await callback.answer()
         return
-    temps = user_temp_messages.get(message.from_user.id, {})
-    await delete_message_safe(bot, message.chat.id, temps.get('reflection'))
+    if category not in ("сон", "зависание"):
+        await callback.answer()
+        return
+    await callback.message.delete()
+    temps = user_temp_messages.get(user_id, {})
+    await delete_message_safe(bot, callback.message.chat.id, temps.get('reflection'))
     await state.update_data(category=category)
     await state.set_state(RatingState.waiting_for_rating)
-    msg = await message.answer(f"📝 Оцени {category.upper()} за сегодня:", reply_markup=rating_keyboard())
-    temps['rating'] = msg.message_id
-    # Сохраняем флаг all_categories_filled для последующей проверки в process_rating
-    user_temp_messages[message.from_user.id] = temps
-
-@router.message(F.text == "🎯 Настрой")
-async def handle_mood_category(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
-    temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, message.chat.id, temps.get('reflection'))
-    await state.set_state(RatingState.waiting_for_mood_text)
-    msg = await message.answer(
-        "🎯 Опиши в паре предложений, как прошёл твой день и что ты сегодня чувствовал(а):",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="mood_back")]
-        ])
-    )
+    msg = await callback.message.answer(f"📝 Оцени {category.upper()} за сегодня:", reply_markup=rating_keyboard())
     temps['rating'] = msg.message_id
     user_temp_messages[user_id] = temps
-
-@router.callback_query(RatingState.waiting_for_mood_text, F.data == "mood_back")
-async def mood_back(callback: CallbackQuery, bot: Bot, state: FSMContext):
-    user_id = callback.from_user.id
-    temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, callback.message.chat.id, temps.get('rating'))
-    await show_reflection_menu(user_id, callback.message.chat.id, bot, state, callback.from_user.first_name)
     await callback.answer()
 
 @router.message(RatingState.waiting_for_mood_text)
 async def process_mood_text(message: Message, bot: Bot, state: FSMContext):
-    # На случай, если пользователь нажмёт reply-кнопку «🔙 Назад» меню рефлексии
-    if message.text == "🔙 Назад":
-        try:
-            await message.delete()
-        except:
-            pass
-        await show_reflection_menu(message.from_user.id, message.chat.id, bot, state, message.from_user.first_name)
-        return
     description = (message.text or "").strip()
     if len(description) < 3:
         await message.answer("Напиши чуть подробнее, как прошёл день 🙂")
@@ -3632,26 +3616,6 @@ async def process_mood_text(message: Message, bot: Bot, state: FSMContext):
         user_temp_messages[user_id] = temps
         await show_reflection_menu(user_id, message.chat.id, bot, state, message.from_user.first_name)
 
-@router.message(F.text == "🔙 Назад в меню")
-async def back_to_main_msg(message: Message, bot: Bot, state: FSMContext):
-    user_id = message.from_user.id
-    # Удаляем временные сообщения, сохраняя важные
-    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
-    # Убираем инлайн кнопки у сохранённых сообщений
-    temps = user_temp_messages.get(user_id, {})
-    for key in ['photo_analysis_result', 'photo_user', 'body_fat_measurements', 'body_fat_result']:
-        if key in temps:
-            try:
-                await bot.edit_message_reply_markup(message.chat.id, temps[key])
-            except:
-                pass
-    try:
-        await message.delete()
-    except:
-        pass
-    await state.clear()
-    await send_main_menu(bot, user_id, message.chat.id)
-
 @router.callback_query(F.data == "back_to_main")
 @router.callback_query(F.data == "back_to_main_from_ai")
 async def back_to_main_callback(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -3673,26 +3637,6 @@ async def back_to_main_callback(callback: CallbackQuery, bot: Bot, state: FSMCon
                 pass
     await send_main_menu(bot, user_id, callback.message.chat.id)
     await callback.answer()
-
-@router.message(F.text == "🔙 Назад")
-async def back_from_reflection(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    await state.clear()
-    user_id = message.from_user.id
-    # Удаляем временные сообщения, сохраняя важные
-    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
-    # Убираем инлайн кнопки у сохранённых сообщений
-    temps = user_temp_messages.get(user_id, {})
-    for key in ['photo_analysis_result', 'photo_user', 'body_fat_measurements', 'body_fat_result']:
-        if key in temps:
-            try:
-                await bot.edit_message_reply_markup(message.chat.id, temps[key])
-            except:
-                pass
-    await send_main_menu(bot, user_id, message.chat.id)
 
 @router.callback_query(F.data.startswith("rate:"))
 async def process_rating(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -3796,25 +3740,23 @@ async def skip_analysis(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.answer()
 
 # ---------- ИИ-СОВЕТЧИК ----------
-@router.message(F.text == "Check AI")
-async def handle_ai(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
+@router.callback_query(F.data == "menu_ai")
+async def handle_ai(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.delete()
     await state.clear()
     old_menu = user_last_menu.get(user_id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
         user_last_menu[user_id] = None
     # Удаляем оставшиеся временные сообщения других разделов (фото/замеры/ИИ сохраняются)
-    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
+    await delete_temp_messages(bot, user_id, callback.message.chat.id, keep_ai=True)
     temps = user_temp_messages.setdefault(user_id, {})
-    # Заготовленное сообщение с reply кнопкой
-    msg = await message.answer("🤖 CheckAI тут, чем помочь?", reply_markup=ai_reply_keyboard())
+    msg = await callback.message.answer("🤖 CheckAI тут, чем помочь?", reply_markup=ai_reply_keyboard())
     temps['ai_advisor'] = msg.message_id
+    nav_push(user_id, "ai")
     await state.set_state(AIAdvisorState.waiting_for_question)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "wp_edit_retry")
@@ -4031,27 +3973,26 @@ async def show_workout_main_menu(user_id: int, chat_id: int, bot: Bot):
         + today_str
     )
     msg = await bot.send_message(chat_id, text, reply_markup=workout_main_keyboard())
+    nav_push(user_id, "workout")
     temps = user_temp_messages.get(user_id, {})
     temps['workout_menu'] = msg.message_id
     user_temp_messages[user_id] = temps
 
-@router.message(F.text == "🏋️ Тренировки")
-async def handle_workouts(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
+@router.callback_query(F.data == "menu_workouts")
+async def handle_workouts(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    user_id = callback.from_user.id
     await state.clear()
     old_menu = user_last_menu.get(user_id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
         user_last_menu[user_id] = None
     # Sweep any leftover temp messages from an interrupted flow (add-workout,
     # AI plan wizard, skip-reason prompt, calorie entry, etc.) — every other
     # section entry point (handle_diet, back_to_main_msg, ...) already does this.
-    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
-    await show_workout_main_menu(user_id, message.chat.id, bot)
+    await delete_temp_messages(bot, user_id, callback.message.chat.id, keep_ai=True)
+    await show_workout_main_menu(user_id, callback.message.chat.id, bot)
+    await callback.answer()
 
 @router.message(WorkoutState.waiting_for_goal)
 async def process_workout_goal(message: Message, bot: Bot, state: FSMContext):
@@ -4082,24 +4023,23 @@ async def _do_workout_add(user_id: int, chat_id: int, bot: Bot, state: FSMContex
     msg = await bot.send_message(chat_id, "Выбери категорию упражнения:", reply_markup=workout_categories_keyboard(categories, action="add"))
     user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
-@router.message(F.text == "🏋️ Добавить выполнение")
-async def workout_add_msg(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
+@router.callback_query(F.data == "menu_workout_add")
+async def workout_add_msg(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    user_id = callback.from_user.id
     await state.clear()
     plan_data = get_ai_plan(user_id)
     if not plan_data:
-        name = get_user_name(user_id, message.from_user.first_name)
-        msg = await message.answer(
+        name = get_user_name(user_id, callback.from_user.first_name)
+        msg = await callback.message.answer(
             f"{name}, план тренировок не настроен.\n\nСоздать план с ИИ или введёшь свой?",
             reply_markup=wp_mode_keyboard()
         )
         user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
+        nav_push(user_id, "wp_mode")
     else:
-        await show_ai_workout_today(user_id, message.chat.id, bot, state)
+        await show_ai_workout_today(user_id, callback.message.chat.id, bot, state)
+    await callback.answer()
 
 @router.callback_query(F.data == "workout_add")
 async def workout_add_start(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -4472,6 +4412,7 @@ async def _show_ai_workout_today_inner(user_id: int, chat_id: int, bot: Bot, sta
     plan_data = get_ai_plan(user_id)
     if not plan_data:
         return
+    nav_push(user_id, "workout_today")
 
     today_exercises = get_today_plan(plan_data, user_id)
     temps = user_temp_messages.get(user_id, {})
@@ -4560,6 +4501,7 @@ async def wp_choose_ai(callback: CallbackQuery, bot: Bot, state: FSMContext):
         "Создание плана тренировок\n\nШаг 1 из 3\nКакая твоя цель?",
         reply_markup=wp_goal_keyboard()
     )
+    nav_push(callback.from_user.id, "wp_goal")
     await callback.answer()
 
 @router.callback_query(F.data == "wp_mode_manual")
@@ -4583,11 +4525,9 @@ async def wp_choose_manual(callback: CallbackQuery, bot: Bot, state: FSMContext)
         "Неделя 3 - Жим на наклонной - 3x11(90кг)\n"
         "Разгибания трицепса - 3x12(40кг)\n\n"
         "Упражнения без метки «Неделя N» дублируются во все недели.\n\n"
-        "⚠️ Чем точнее формат — тем лучше ИИ разберёт план.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="wp_back_to_mode")]
-        ])
+        "⚠️ Чем точнее формат — тем лучше ИИ разберёт план."
     )
+    nav_push(callback.from_user.id, "wp_manual")
     await callback.answer()
 
 @router.callback_query(F.data == "wp_back_to_mode")
@@ -4598,6 +4538,7 @@ async def wp_back_to_mode(callback: CallbackQuery, bot: Bot, state: FSMContext):
         f"{name}, давай настроим тренировки!\n\nСоздать план с ИИ или введёшь свой?",
         reply_markup=wp_mode_keyboard()
     )
+    nav_push(callback.from_user.id, "wp_mode")
     await callback.answer()
 
 # --- Онбординг ИИ ---
@@ -4612,6 +4553,7 @@ async def wp_choose_goal(callback: CallbackQuery, bot: Bot, state: FSMContext):
         f"Создание плана тренировок\n\nШаг 2 из 3\nТвой уровень подготовки?",
         reply_markup=wp_level_keyboard()
     )
+    nav_push(callback.from_user.id, "wp_level")
     await callback.answer()
 
 @router.callback_query(F.data == "wp_back_to_goal")
@@ -4621,6 +4563,7 @@ async def wp_back_to_goal(callback: CallbackQuery, bot: Bot, state: FSMContext):
         "Создание плана тренировок\n\nШаг 1 из 3\nКакая твоя цель?",
         reply_markup=wp_goal_keyboard()
     )
+    nav_push(callback.from_user.id, "wp_goal")
     await callback.answer()
 
 @router.callback_query(AIPlanState.choosing_level, F.data.startswith("wp_level_"))
@@ -4634,6 +4577,7 @@ async def wp_choose_level(callback: CallbackQuery, bot: Bot, state: FSMContext):
         "Создание плана тренировок\n\nШаг 3 из 3\nСколько тренировок в неделю готов делать?",
         reply_markup=wp_days_keyboard()
     )
+    nav_push(callback.from_user.id, "wp_days")
     await callback.answer()
 
 @router.callback_query(F.data == "wp_back_to_level")
@@ -4643,6 +4587,7 @@ async def wp_back_to_level(callback: CallbackQuery, bot: Bot, state: FSMContext)
         "Создание плана тренировок\n\nШаг 2 из 3\nТвой уровень подготовки?",
         reply_markup=wp_level_keyboard()
     )
+    nav_push(callback.from_user.id, "wp_level")
     await callback.answer()
 
 @router.callback_query(AIPlanState.choosing_days_count, F.data.startswith("wp_days_"))
@@ -4658,10 +4603,10 @@ async def wp_choose_days(callback: CallbackQuery, bot: Bot, state: FSMContext):
         "Например: «травма колена», «нет штанги», «только утром»\n"
         "Или нажми Пропустить:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Пропустить →", callback_data="wp_notes_skip")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="wp_back_to_days")]
+            [InlineKeyboardButton(text="Пропустить →", callback_data="wp_notes_skip")]
         ])
     )
+    nav_push(callback.from_user.id, "wp_notes")
     await callback.answer()
 
 @router.callback_query(AIPlanState.entering_extra_notes, F.data == "wp_notes_skip")
@@ -4744,6 +4689,7 @@ async def _generate_and_show_plan(callback, bot: Bot, state: FSMContext):
         msg = await bot.send_message(callback.message.chat.id, text,
                                       reply_markup=wp_plan_review_keyboard())
         user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
+    nav_push(user_id, "wp_review")
 
 @router.callback_query(F.data == "wp_back_to_days")
 async def wp_back_to_days(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -4752,6 +4698,7 @@ async def wp_back_to_days(callback: CallbackQuery, bot: Bot, state: FSMContext):
         "Создание плана тренировок\n\nШаг 3 из 3\nСколько тренировок в неделю?",
         reply_markup=wp_days_keyboard()
     )
+    nav_push(callback.from_user.id, "wp_days")
     await callback.answer()
 
 @router.callback_query(F.data == "wp_plan_regenerate")
@@ -4769,9 +4716,9 @@ async def wp_plan_edit_start(callback: CallbackQuery, bot: Bot, state: FSMContex
     await callback.message.edit_text(
         "Что хочешь изменить в плане?\n\nНапиши например:\n"
         "«убери приседания, замени на жим ногами»\n"
-        "«добавь кардио в пятницу»",
-        reply_markup=wp_edit_keyboard()
+        "«добавь кардио в пятницу»"
     )
+    nav_push(callback.from_user.id, "wp_edit")
     await callback.answer()
 
 @router.callback_query(F.data == "wp_back_to_review")
@@ -4787,6 +4734,7 @@ async def wp_back_to_review(callback: CallbackQuery, bot: Bot, state: FSMContext
     await state.set_state(AIPlanState.reviewing_plan)
     text = _format_full_plan(plan, goal, level, days)
     await callback.message.edit_text(text, reply_markup=wp_plan_review_keyboard())
+    nav_push(callback.from_user.id, "wp_review")
     await callback.answer()
 
 async def _handle_exercise_replace(message: Message, bot: Bot, state: FSMContext):
@@ -4819,17 +4767,13 @@ async def _handle_exercise_replace(message: Message, bot: Bot, state: FSMContext
     confirm = f"Заменено: «{old_name}» → «{new_name}»"
     if msg_id:
         try:
-            await bot.edit_message_text(confirm, message.chat.id, msg_id,
-                                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                             [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
-                                         ]))
+            await bot.edit_message_text(confirm, message.chat.id, msg_id)
             return
         except:
             pass
-    msg = await message.answer(confirm, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
-    ]))
+    msg = await message.answer(confirm)
     user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
+    nav_push(user_id, "workout_manage")
 
 @router.message(AIPlanState.editing_plan)
 async def wp_plan_edit_input(message: Message, bot: Bot, state: FSMContext):
@@ -4873,8 +4817,7 @@ async def wp_plan_edit_input(message: Message, bot: Bot, state: FSMContext):
             pass
     if not new_plan:
         back_to_workout_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="wp_edit_retry")],
-            [InlineKeyboardButton(text="🔙 К тренировкам", callback_data="workout_manage_back")]
+            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="wp_edit_retry")]
         ])
         try:
             await bot.edit_message_text(
@@ -4883,6 +4826,7 @@ async def wp_plan_edit_input(message: Message, bot: Bot, state: FSMContext):
             )
         except:
             pass
+        nav_push(message.from_user.id, "wp_edit")
         return
     await state.update_data(wp_plan=new_plan)
     await state.set_state(AIPlanState.reviewing_plan)
@@ -4913,6 +4857,9 @@ async def wp_plan_accept(callback: CallbackQuery, bot: Bot, state: FSMContext):
     delete_all_workout_data(user_id)
     save_ai_plan(user_id, mode, goal, level, days, plan, cycle_weeks)
     await state.clear()
+    # Мастер создания плана пройден — выкидываем его шаги из стека навигации
+    stack = user_nav.get(user_id) or []
+    user_nav[user_id] = [s for s in stack if not s.startswith("wp_")]
     # Показываем сообщение о сохранении и удаляем его через 2 секунды
     await callback.message.edit_text("✅ План сохранён! Возвращайся когда будешь готов тренироваться.")
     await asyncio.sleep(2)
@@ -4977,8 +4924,7 @@ async def wp_manual_input(message: Message, bot: Bot, state: FSMContext):
                 "❌ Не смог разобрать план. Можно скинуть тот же текст — я попробую снова.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="🔄 Попробовать снова",
-                                          callback_data="retry_ai:manual_plan")],
-                    [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
+                                          callback_data="retry_ai:manual_plan")]
                 ])
             )
             user_temp_messages.setdefault(user_id, {})['workout_error'] = err_msg.message_id
@@ -5455,11 +5401,8 @@ async def wp_monthly_review_start(callback: CallbackQuery, bot: Bot, state: FSMC
     for i, ch in enumerate(chg, 1):
         lines.append(f"{i}. {ch['old_exercise']} → {ch['new_exercise']}\n   {ch['reason']}")
     lines.append("\nНапиши номера изменений которые принять (например: 1 3) или «нет» чтобы отклонить всё:")
-    await callback.message.edit_text("\n".join(lines),
-                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                          [InlineKeyboardButton(text="🔙 Назад",
-                                                                callback_data="wp_review_decline")]
-                                      ]))
+    await callback.message.edit_text("\n".join(lines))
+    nav_push(callback.from_user.id, "wp_review_decline_prompt")
     await callback.answer()
 
 @router.message(WorkoutSessionState.monthly_review)
@@ -5562,112 +5505,72 @@ async def _do_workout_manage(user_id: int, chat_id: int, bot: Bot):
     cursor = db.execute('SELECT id, name FROM exercise_categories WHERE user_id = ? ORDER BY name', (user_id,))
     categories = cursor.fetchall()
     msg = await bot.send_message(chat_id, "📋 Мои категории:", reply_markup=workout_categories_keyboard(categories, action="manage"))
+    nav_push(user_id, "categories")
     user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
 
 
-@router.message(F.text == "📋 Управление")
-async def workout_manage_msg(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
+async def _show_workout_manage_menu(user_id: int, chat_id: int, bot: Bot, state: FSMContext):
+    """Экран «📋 Управление» (настройки плана). Родитель — меню тренировок."""
+    nav_push(user_id, "workout_manage")
     plan_data = get_ai_plan(user_id)
-    if not plan_data:
-        await message.answer("План не настроен. Зайди в «🏋️ Добавить выполнение» чтобы создать.",
-                              reply_markup=workout_main_keyboard())
-        return
-    temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
-    user_temp_messages[user_id] = temps
     mode = plan_data.get("mode", "ai") if plan_data else "ai"
-    msg = await message.answer("Управление планом:", reply_markup=workout_manage_reply_keyboard(mode))
+    temps = user_temp_messages.get(user_id, {})
+    await delete_message_safe(bot, chat_id, temps.pop('workout_menu', None))
+    user_temp_messages[user_id] = temps
+    msg = await bot.send_message(chat_id, "Управление планом:", reply_markup=workout_manage_reply_keyboard(mode))
     user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
 
-@router.message(F.text == "✏️ Редактировать план (ИИ)")
-async def workout_edit_plan_msg(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
+
+@router.callback_query(F.data == "menu_workout_manage")
+async def workout_manage_msg(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = callback.from_user.id
     plan_data = get_ai_plan(user_id)
     if not plan_data:
+        await callback.message.delete()
+        await callback.message.answer("План не настроен. Зайди в «🏋️ Добавить выполнение» чтобы создать.",
+                                      reply_markup=workout_main_keyboard())
+        nav_push(user_id, "workout")
+        await callback.answer()
+        return
+    await callback.message.delete()
+    await _show_workout_manage_menu(user_id, callback.message.chat.id, bot, state)
+    await callback.answer()
+
+@router.callback_query(F.data == "wp_edit_plan")
+async def workout_edit_plan_msg(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    user_id = callback.from_user.id
+    plan_data = get_ai_plan(user_id)
+    if not plan_data:
+        await callback.answer()
         return
     await state.set_state(AIPlanState.editing_plan)
     await state.update_data(wp_plan=plan_data["plan"], wp_goal=plan_data.get("goal",""),
                             wp_level=plan_data.get("level",""), wp_days=plan_data.get("days_per_week",3))
     temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
-    msg = await message.answer(
-        "Что изменить в плане?\n\nНапример:\n«убери приседания, замени на жим ногами»\n«добавь кардио в пятницу»",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
-        ])
+    await delete_message_safe(bot, callback.message.chat.id, temps.pop('workout_menu', None))
+    msg = await callback.message.answer(
+        "Что изменить в плане?\n\nНапример:\n«убери приседания, замени на жим ногами»\n«добавь кардио в пятницу»"
     )
     user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
+    nav_push(user_id, "wp_edit")
+    await callback.answer()
 
-@router.message(F.text == "🆕 Новый план (ИИ)")
-async def workout_new_ai_plan_msg(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
-    name = get_user_name(user_id, message.from_user.first_name)
+@router.callback_query(F.data == "wp_new_plan")
+async def workout_new_ai_plan_msg(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    user_id = callback.from_user.id
+    name = get_user_name(user_id, callback.from_user.first_name)
     temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
+    await delete_message_safe(bot, callback.message.chat.id, temps.pop('workout_menu', None))
     await state.set_state(AIPlanState.choosing_goal)
-    msg = await message.answer(
+    msg = await callback.message.answer(
         f"{name}, создаём новый план с нуля.\n\nШаг 1 из 3\nКакая твоя цель?",
         reply_markup=wp_goal_keyboard()
     )
     user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
-
-@router.message(F.text == "📝 Загрузить свой план")
-async def workout_replace_plan_msg(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
-    temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
-    await delete_message_safe(bot, message.chat.id, temps.pop('workout_error', None))
-    await state.set_state(AIPlanState.entering_manual_plan)
-    msg = await message.answer(
-        "Отправь план одним сообщением в таком формате:\n\n"
-        "День недели:\n"
-        "Название упражнения - СетыxПовторения(Вес)\n\n"
-        "Примеры строк:\n"
-        "Жим лёжа - 3x5(110кг)\n"
-        "Подтягивания - 3x10(+20кг)\n"
-        "Становая тяга - МАХ(120кг)\n"
-        "Отжимания - МАХ повторений(20кг)\n"
-        "Присед - 2x(от 80кг к 60кг)\n"
-        "Тренировка навыков - 40 минут\n\n"
-        "Если в один день разные упражнения по неделям:\n"
-        "Понедельник:\n"
-        "Неделя 1 - Жим лёжа - МАХ(120кг)\n"
-        "Неделя 2 - Жим лёжа - 3x5(110кг)\n"
-        "Неделя 3 - Жим на наклонной - 3x11(90кг)\n"
-        "Разгибания трицепса - 3x12(40кг)\n\n"
-        "Упражнения без метки «Неделя N» дублируются во все недели.\n\n"
-        "⚠️ Чем точнее формат — тем лучше ИИ разберёт план.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")]
-        ])
-    )
-    user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
-
-@router.message(F.text == "🔙 Назад к тренировкам")
-async def back_to_workout_main(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    await state.clear()
-    await show_workout_main_menu(message.from_user.id, message.chat.id, bot)
+    nav_push(user_id, "wp_goal")
+    await callback.answer()
 
 @router.callback_query(F.data == "workout_manage_back")
 async def workout_manage_back_cb(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -5755,6 +5658,7 @@ async def workout_manage_after_action(user_id: int, chat_id: int, bot: Bot):
     cursor = db.execute('SELECT id, name FROM exercise_categories WHERE user_id = ? ORDER BY name', (user_id,))
     categories = cursor.fetchall()
     msg = await bot.send_message(chat_id, "📋 Мои категории:", reply_markup=workout_categories_keyboard(categories, action="manage"))
+    nav_push(user_id, "categories")
     temps['workout_temp'] = msg.message_id
     user_temp_messages[user_id] = temps
 
@@ -6232,17 +6136,16 @@ async def show_workout_history_page(user_id: int, chat_id: int, bot: Bot, page: 
     rows = cursor.fetchall()
     if not rows:
         text = "Тренировок пока нет."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="workout_history_back")]
-        ])
         if edit_msg_id:
             try:
-                await bot.edit_message_text(text, chat_id, edit_msg_id, reply_markup=kb)
+                await bot.edit_message_text(text, chat_id, edit_msg_id)
+                nav_push(user_id, "workout_history")
                 return
             except:
                 pass
-        msg = await bot.send_message(chat_id, text, reply_markup=kb)
+        msg = await bot.send_message(chat_id, text)
         user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
+        nav_push(user_id, "workout_history")
         return
     total = len(rows)
     page = max(0, min(page, total - 1))
@@ -6260,7 +6163,6 @@ async def show_workout_history_page(user_id: int, chat_id: int, bot: Bot, page: 
     if nav:
         kb_rows.append(nav)
     kb_rows.append([InlineKeyboardButton(text=f"{total - page}/{total}", callback_data="wh_noop")])
-    kb_rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="workout_history_back")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     if edit_msg_id:
         try:
@@ -6270,6 +6172,7 @@ async def show_workout_history_page(user_id: int, chat_id: int, bot: Bot, page: 
             pass
     msg = await bot.send_message(chat_id, text, reply_markup=kb)
     user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
+    nav_push(user_id, "workout_history")
 
 
 @router.message(F.text == "✏️ Изменить упражнение")
@@ -6299,11 +6202,11 @@ async def workout_edit_exercise_start(message: Message, bot: Bot, state: FSMCont
                     text=day_names[day_key],
                     callback_data=f"wex_day_{day_key}"
                 )])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")])
     temps = user_temp_messages.get(user_id, {})
     await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
     msg = await message.answer("Выбери день тренировки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     user_temp_messages.setdefault(user_id, {})['workout_menu'] = msg.message_id
+    nav_push(user_id, "wex_days")
     await state.set_state(AIPlanState.editing_plan)
     await state.update_data(wp_edit_mode="exercise")
 
@@ -6333,8 +6236,8 @@ async def workout_edit_choose_day(callback: CallbackQuery, bot: Bot, state: FSMC
     for i, ex in enumerate(exercises):
         name = ex.get("exercise", ex.get("name", f"Упражнение {i+1}"))
         buttons.append([InlineKeyboardButton(text=name, callback_data=f"wex_ex_{i}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="wex_back_to_days")])
     await callback.message.edit_text("Выбери упражнение для замены:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    nav_push(callback.from_user.id, "wex_ex")
     await callback.answer()
 
 @router.callback_query(AIPlanState.editing_plan, F.data == "wex_back_to_days")
@@ -6357,8 +6260,8 @@ async def workout_edit_back_to_days(callback: CallbackQuery, bot: Bot, state: FS
             if day_key in week and day_key not in seen_days:
                 seen_days.add(day_key)
                 buttons.append([InlineKeyboardButton(text=day_names[day_key], callback_data=f"wex_day_{day_key}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="workout_manage_back")])
     await callback.message.edit_text("Выбери день тренировки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    nav_push(callback.from_user.id, "wex_days")
     await callback.answer()
 
 @router.callback_query(AIPlanState.editing_plan, F.data.startswith("wex_ex_"))
@@ -6387,24 +6290,18 @@ async def workout_edit_choose_exercise(callback: CallbackQuery, bot: Bot, state:
     await state.update_data(wp_edit_ex_idx=ex_idx, wp_edit_ex_name=ex_name,
                             wp_edit_mode="exercise_replace")
     await callback.message.edit_text(
-        f"Чем заменить «{ex_name}»?\n\nНапиши название нового упражнения:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"wex_day_{day_key}")]
-        ])
+        f"Чем заменить «{ex_name}»?\n\nНапиши название нового упражнения:"
     )
+    nav_push(callback.from_user.id, "wex_replace")
     await callback.answer()
 
-@router.message(F.text == "📊 История")
-async def workout_history_ai_msg(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
-    temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, message.chat.id, temps.pop('workout_menu', None))
-    user_temp_messages[user_id] = temps
-    await show_workout_history_page(user_id, message.chat.id, bot, 0)
+@router.callback_query(F.data == "workout_history")
+async def workout_history(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.delete()
+    user_history_page[user_id] = 0
+    await show_history_page(user_id, callback.message.chat.id, bot, state)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("wh_page_"))
 async def workout_history_page(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6426,22 +6323,6 @@ async def workout_history_back(callback: CallbackQuery, bot: Bot, state: FSMCont
         pass
     await show_workout_main_menu(user_id, callback.message.chat.id, bot)
     await callback.answer()
-
-@router.message(F.text == "📊 История")
-async def workout_history_msg(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_history_page[message.from_user.id] = 0
-    await show_history_page(message.from_user.id, message.chat.id, bot, state)
-
-@router.callback_query(F.data == "workout_history")
-async def workout_history(callback: CallbackQuery, bot: Bot, state: FSMContext):
-    user_id = callback.from_user.id
-    user_history_page[user_id] = 0
-    await callback.message.delete()
-    await show_history_page(user_id, callback.message.chat.id, bot, state)
 
 async def show_history_page(user_id: int, chat_id: int, bot: Bot, state: FSMContext, edit_message_id: int = None):
     page = user_history_page.get(user_id, 0)
@@ -6509,7 +6390,6 @@ async def show_history_page(user_id: int, chat_id: int, bot: Bot, state: FSMCont
     keyboard_buttons = []
     if nav_buttons:
         keyboard_buttons.append(nav_buttons)
-    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="workout_main")])
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
 
@@ -6518,6 +6398,7 @@ async def show_history_page(user_id: int, chat_id: int, bot: Bot, state: FSMCont
     else:
         msg = await bot.send_message(chat_id, text, reply_markup=reply_markup)
         user_temp_messages.setdefault(user_id, {})['workout_history'] = msg.message_id
+    nav_push(user_id, "history")
 
 @router.callback_query(F.data == "history_prev")
 async def history_prev(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6548,14 +6429,6 @@ async def _do_workout_charts(user_id: int, chat_id: int, bot: Bot, state: FSMCon
     await state.update_data(workout_charts_mode=True)
     msg = await bot.send_message(chat_id, "Выбери категорию для графика:", reply_markup=workout_categories_keyboard(categories, action="add"))
     user_temp_messages.setdefault(user_id, {})['workout_temp'] = msg.message_id
-
-@router.message(F.text == "📈 Графики упражнений")
-async def workout_charts_msg(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    await _do_workout_charts(message.from_user.id, message.chat.id, bot, state)
 
 @router.callback_query(F.data == "workout_charts")
 async def workout_charts_start(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6638,8 +6511,7 @@ async def workout_charts_generate(callback: CallbackQuery, bot: Bot, state: FSMC
     await callback.bot.send_photo(
         user_id,
         photo,
-        caption="📈 Прогресс упражнения",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_workout")]])
+        caption="📈 Прогресс упражнения"
     )
     os.remove(chart_path)
     await callback.answer()
@@ -6667,27 +6539,26 @@ async def workout_show_goal(callback: CallbackQuery, bot: Bot):
   
   
 # ---------- ДИЕТА ----------
-@router.message(F.text == "🍽 Диета")
-async def handle_diet(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
-    user_id = message.from_user.id
+@router.callback_query(F.data == "menu_diet")
+async def handle_diet(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    user_id = callback.from_user.id
     await state.clear()
     profile = get_diet_profile(user_id)
     old_menu = user_last_menu.get(user_id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
         user_last_menu[user_id] = None
     if not profile:
         await state.set_state(DietState.weight)
-        await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
-        msg = await message.answer("📝 Введи свой вес (в кг):")
+        await delete_temp_messages(bot, user_id, callback.message.chat.id, keep_ai=True)
+        msg = await callback.message.answer("📝 Введи свой вес (в кг):")
         user_temp_messages.setdefault(user_id, {})['diet_setup'] = msg.message_id
+        await callback.answer()
         return
-    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
-    await show_diet_menu(user_id, message.chat.id, bot)
+    await delete_temp_messages(bot, user_id, callback.message.chat.id, keep_ai=True)
+    await show_diet_menu(user_id, callback.message.chat.id, bot)
+    await callback.answer()
 
 async def show_diet_menu(user_id: int, chat_id: int, bot: Bot):
     profile = get_diet_profile(user_id)
@@ -6716,24 +6587,29 @@ async def show_diet_menu(user_id: int, chat_id: int, bot: Bot):
 
 Выбери действие:"""
     msg = await bot.send_message(chat_id, text, reply_markup=diet_menu_reply_keyboard())
+    nav_push(user_id, "diet")
     user_temp_messages.setdefault(user_id, {})['diet_menu'] = msg.message_id
 
-@router.message(F.text == "🍎 Записать еду")
-async def diet_log_food_reply(message: Message, bot: Bot, state: FSMContext):
-    await delete_message_safe(bot, message.chat.id, message.message_id)
-    user_id = message.from_user.id
+@router.callback_query(F.data == "diet_food")
+async def diet_log_food_reply(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    await _diet_log_food_start(callback.from_user.id, callback.message.chat.id, bot, state)
+    await callback.answer()
+
+async def _diet_log_food_start(user_id: int, chat_id: int, bot: Bot, state: FSMContext):
     # Удаляем меню диеты
     temps = user_temp_messages.get(user_id, {})
-    await delete_message_safe(bot, message.chat.id, temps.get('diet_menu'))
+    await delete_message_safe(bot, chat_id, temps.get('diet_menu'))
     old_menu = user_last_menu.get(user_id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
+        await delete_message_safe(bot, chat_id, old_menu)
         user_last_menu[user_id] = None
-    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
+    await delete_temp_messages(bot, user_id, chat_id, keep_ai=True)
     await state.clear()
     await state.set_state(DietState.meal_type)
-    msg = await message.answer("Выбери приём пищи:", reply_markup=meal_type_keyboard())
+    msg = await bot.send_message(chat_id, "Выбери приём пищи:", reply_markup=meal_type_keyboard())
     user_temp_messages.setdefault(user_id, {})['diet_temp'] = msg.message_id
+    nav_push(user_id, "diet_meal")
 
 @router.callback_query(DietState.meal_type, F.data.startswith("meal_type:"))
 async def diet_choose_meal(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -6812,7 +6688,7 @@ async def diet_choose_my_food(callback: CallbackQuery, bot: Bot, state: FSMConte
         await callback.message.answer(text, reply_markup=diet_confirm_food_keyboard())
     else:
         await callback.answer("❌ Блюдо не найдено", show_alert=True)
-        await diet_log_food_reply(callback.message, bot, state)
+        await _diet_log_food_start(callback.from_user.id, callback.message.chat.id, bot, state)
     await callback.answer()
 
 @router.callback_query(DietState.food_description, F.data == "food_create_new")
@@ -7122,18 +6998,19 @@ async def food_cancel(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.answer()
 
 # ---------- Запись веса ----------
-@router.message(F.text == "⚖️ Записать вес")
-async def diet_log_weight_reply(message: Message, bot: Bot, state: FSMContext):
-    await delete_message_safe(bot, message.chat.id, message.message_id)
-    old_menu = user_last_menu.get(message.from_user.id)
+@router.callback_query(F.data == "diet_weight")
+async def diet_log_weight_reply(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    old_menu = user_last_menu.get(callback.from_user.id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
-        user_last_menu[message.from_user.id] = None
-    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
+        user_last_menu[callback.from_user.id] = None
+    await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
     await state.clear()
     await state.set_state(DietState.log_weight)
-    msg = await message.answer("⚖️ Введи свой текущий вес (в кг):")
-    user_temp_messages.setdefault(message.from_user.id, {})['diet_temp'] = msg.message_id
+    msg = await callback.message.answer("⚖️ Введи свой текущий вес (в кг):")
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
+    await callback.answer()
 
 @router.message(DietState.log_weight)
 async def diet_log_weight_finish(message: Message, bot: Bot, state: FSMContext):
@@ -7186,14 +7063,14 @@ async def diet_log_weight_finish(message: Message, bot: Bot, state: FSMContext):
     await show_diet_menu(user_id, message.chat.id, bot)
 
 # ---------- Расчёт % жира ----------
-@router.message(F.text == "🧮 Рассчитать % жира")
-async def diet_body_fat_reply(message: Message, bot: Bot, state: FSMContext):
-    await delete_message_safe(bot, message.chat.id, message.message_id)
-    old_menu = user_last_menu.get(message.from_user.id)
+@router.callback_query(F.data == "diet_bodyfat")
+async def diet_body_fat_reply(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    old_menu = user_last_menu.get(callback.from_user.id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
-        user_last_menu[message.from_user.id] = None
-    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
+        user_last_menu[callback.from_user.id] = None
+    await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
     await state.clear()
     instructions = (
         "Введи свои данные в одной строке через пробел:\n"
@@ -7202,8 +7079,9 @@ async def diet_body_fat_reply(message: Message, bot: Bot, state: FSMContext):
         "Пример для женщины: 165 60 38 70 95"
     )
     await state.set_state(DietState.body_fat_measurements)
-    msg = await message.answer(instructions)
-    user_temp_messages.setdefault(message.from_user.id, {})['diet_temp'] = msg.message_id
+    msg = await callback.message.answer(instructions)
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_temp'] = msg.message_id
+    await callback.answer()
 
 @router.message(DietState.body_fat_measurements)
 async def diet_body_fat_calculate(message: Message, bot: Bot, state: FSMContext):
@@ -7276,17 +7154,18 @@ async def diet_body_fat_calculate(message: Message, bot: Bot, state: FSMContext)
     await show_diet_menu(user_id, message.chat.id, bot)
 
 # ---------- История еды ----------
-@router.message(F.text == "📖 История еды")
-async def diet_food_history_reply(message: Message, bot: Bot, state: FSMContext):
-    await delete_message_safe(bot, message.chat.id, message.message_id)
-    old_menu = user_last_menu.get(message.from_user.id)
+@router.callback_query(F.data == "diet_food_history")
+async def diet_food_history_reply(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    old_menu = user_last_menu.get(callback.from_user.id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
-        user_last_menu[message.from_user.id] = None
-    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
-    user_id = message.from_user.id
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
+        user_last_menu[callback.from_user.id] = None
+    await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
+    user_id = callback.from_user.id
     user_food_history_page[user_id] = 0
-    await show_food_history_page(user_id, message.chat.id, bot, state)
+    await show_food_history_page(user_id, callback.message.chat.id, bot, state)
+    await callback.answer()
 
 async def show_food_history_page(user_id: int, chat_id: int, bot: Bot, state: FSMContext, edit_message_id: int = None):
     page = user_food_history_page.get(user_id, 0)
@@ -7342,7 +7221,6 @@ async def show_food_history_page(user_id: int, chat_id: int, bot: Bot, state: FS
     keyboard_buttons = []
     if nav_buttons:
         keyboard_buttons.append(nav_buttons)
-    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_diet")])
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
 
@@ -7351,6 +7229,7 @@ async def show_food_history_page(user_id: int, chat_id: int, bot: Bot, state: FS
     else:
         msg = await bot.send_message(chat_id, text, reply_markup=reply_markup)
         user_temp_messages.setdefault(user_id, {})['food_history'] = msg.message_id
+    nav_push(user_id, "food_history")
 
 @router.callback_query(F.data == "food_history_prev")
 async def food_history_prev(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -7377,16 +7256,16 @@ async def back_to_diet(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.answer()
 
 # ---------- Графики диеты ----------
-@router.message(F.text == "📈 Графики веса и % жира")
-async def diet_charts_reply(message: Message, bot: Bot, state: FSMContext):
-    await delete_message_safe(bot, message.chat.id, message.message_id)
-    old_menu = user_last_menu.get(message.from_user.id)
+@router.callback_query(F.data == "diet_charts")
+async def diet_charts_reply(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    old_menu = user_last_menu.get(callback.from_user.id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
-        user_last_menu[message.from_user.id] = None
-    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
-    user_id = message.from_user.id
-    await bot.send_chat_action(message.chat.id, action=ChatAction.UPLOAD_PHOTO)
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
+        user_last_menu[callback.from_user.id] = None
+    await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
+    user_id = callback.from_user.id
+    await bot.send_chat_action(callback.message.chat.id, action=ChatAction.UPLOAD_PHOTO)
 
     cursor = db.execute('SELECT date, weight FROM weight_log WHERE user_id = ? ORDER BY date', (user_id,))
     weight_rows = cursor.fetchall()
@@ -7394,10 +7273,11 @@ async def diet_charts_reply(message: Message, bot: Bot, state: FSMContext):
     fat_rows = cursor.fetchall()
 
     if len(weight_rows) < 2 and len(fat_rows) < 2:
-        err = await message.answer("❌ Недостаточно данных для графиков (нужно минимум 2 записи по весу или % жира).")
+        err = await callback.message.answer("❌ Недостаточно данных для графиков (нужно минимум 2 записи по весу или % жира).")
         await asyncio.sleep(4)
-        await delete_message_safe(bot, message.chat.id, err.message_id)
-        await show_diet_menu(user_id, message.chat.id, bot)
+        await delete_message_safe(bot, callback.message.chat.id, err.message_id)
+        await show_diet_menu(user_id, callback.message.chat.id, bot)
+        await callback.answer()
         return
 
     dates_weight = [datetime.strptime(r[0], '%Y-%m-%d').strftime('%d.%m') for r in weight_rows]
@@ -7418,24 +7298,24 @@ async def diet_charts_reply(message: Message, bot: Bot, state: FSMContext):
     await bot.send_photo(
         user_id,
         photo,
-        caption="📈 Динамика веса и % жира",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_diet")]])
+        caption="📈 Динамика веса и % жира"
     )
     os.remove(chart_path)
 
 # ---------- Изменить цель ----------
-@router.message(F.text == "⚙️ Изменить цель")
-async def diet_change_goal_reply(message: Message, bot: Bot, state: FSMContext):
-    await delete_message_safe(bot, message.chat.id, message.message_id)
-    old_menu = user_last_menu.get(message.from_user.id)
+@router.callback_query(F.data == "diet_goal")
+async def diet_change_goal_reply(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    old_menu = user_last_menu.get(callback.from_user.id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
-        user_last_menu[message.from_user.id] = None
-    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
+        user_last_menu[callback.from_user.id] = None
+    await delete_temp_messages(bot, callback.from_user.id, callback.message.chat.id, keep_ai=True)
     await state.clear()
     await state.set_state(DietState.weight)
-    msg = await message.answer("📝 Введи свой вес (в кг):")
-    user_temp_messages.setdefault(message.from_user.id, {})['diet_setup'] = msg.message_id
+    msg = await callback.message.answer("📝 Введи свой вес (в кг):")
+    user_temp_messages.setdefault(callback.from_user.id, {})['diet_setup'] = msg.message_id
+    await callback.answer()
 
 # ---------- Обработчики шагов настройки диеты ----------
 
@@ -7659,23 +7539,22 @@ async def show_tasks_menu(user_id: int, chat_id: int, bot: Bot):
         text = "📝 Задач пока нет. Добавь первую!"
     kb = tasks_menu_keyboard(tasks, user_id)
     msg = await bot.send_message(chat_id, text, reply_markup=kb)
+    nav_push(user_id, "tasks")
     temps['tasks_menu'] = msg.message_id
     user_temp_messages[user_id] = temps
 
-@router.message(F.text == "📝 Задачи")
-async def handle_tasks(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
+@router.callback_query(F.data == "menu_tasks")
+async def handle_tasks(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
     await state.clear()
-    user_id = message.from_user.id
+    user_id = callback.from_user.id
     old_menu = user_last_menu.get(user_id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
+        await delete_message_safe(bot, callback.message.chat.id, old_menu)
         user_last_menu[user_id] = None
-    await delete_temp_messages(bot, user_id, message.chat.id, keep_ai=True)
-    await show_tasks_menu(user_id, message.chat.id, bot)
+    await delete_temp_messages(bot, user_id, callback.message.chat.id, keep_ai=True)
+    await show_tasks_menu(user_id, callback.message.chat.id, bot)
+    await callback.answer()
 
 @router.callback_query(F.data == "task_noop")
 async def task_noop(callback: CallbackQuery):
@@ -7891,20 +7770,22 @@ async def _save_task(message, user_id: int, bot: Bot, state: FSMContext):
     await show_tasks_menu(user_id, chat_id, bot)
 
 # ---------- СТАТИСТИКА ----------
-@router.message(F.text == "📊 Статистика")
-async def handle_stats(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
+async def _show_stats_choice(user_id: int, chat_id: int, bot: Bot, state: FSMContext):
     await state.clear()
-    old_menu = user_last_menu.get(message.from_user.id)
+    old_menu = user_last_menu.get(user_id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
-        user_last_menu[message.from_user.id] = None
-    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
-    msg = await message.answer("📊 Выбери тип статистики:", reply_markup=stats_keyboard())
-    user_temp_messages.setdefault(message.from_user.id, {})['stats_choice'] = msg.message_id
+        await delete_message_safe(bot, chat_id, old_menu)
+        user_last_menu[user_id] = None
+    await delete_temp_messages(bot, user_id, chat_id, keep_ai=True)
+    msg = await bot.send_message(chat_id, "📊 Выбери тип статистики:", reply_markup=stats_keyboard())
+    user_temp_messages.setdefault(user_id, {})['stats_choice'] = msg.message_id
+    nav_push(user_id, "stats")
+
+@router.callback_query(F.data == "menu_stats")
+async def handle_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    await _show_stats_choice(callback.from_user.id, callback.message.chat.id, bot, state)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("stats:"))
 async def show_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
@@ -7938,11 +7819,10 @@ async def show_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
         temp_msg = await callback.message.answer("📈 Генерирую график...")
         chart_path = create_line_chart(daily_data, callback.from_user.id, days=7)
         photo = FSInputFile(chart_path)
-        await callback.bot.send_photo(
+        await bot.send_photo(
             callback.from_user.id,
             photo,
-            caption="📈 Динамика за неделю",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]])
+            caption="📈 Динамика за неделю"
         )
         await delete_message_safe(bot, callback.message.chat.id, temp_msg.message_id)
         os.remove(chart_path)
@@ -7956,33 +7836,27 @@ async def show_stats(callback: CallbackQuery, bot: Bot, state: FSMContext):
         temp_msg = await callback.message.answer("📈 Генерирую график...")
         chart_path = create_line_chart(daily_data, callback.from_user.id, days=30)
         photo = FSInputFile(chart_path)
-        await callback.bot.send_photo(
+        await bot.send_photo(
             callback.from_user.id,
             photo,
-            caption="📈 Динамика за месяц",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]])
+            caption="📈 Динамика за месяц"
         )
         await delete_message_safe(bot, callback.message.chat.id, temp_msg.message_id)
         os.remove(chart_path)
     await callback.answer()
 
 # ---------- РАНГ ----------
-@router.message(F.text == "⭐ Ранг")
-async def handle_rank(message: Message, bot: Bot, state: FSMContext):
-    try:
-        await message.delete()
-    except:
-        pass
+async def _show_rank(user_id: int, chat_id: int, bot: Bot, state: FSMContext):
     await state.clear()
-    rank_data = get_or_create_rank_data(message.from_user.id)
-    name = get_user_name(message.from_user.id, message.from_user.first_name)
+    rank_data = get_or_create_rank_data(user_id)
+    name = get_user_name(user_id)
     rank_id = rank_data['current_rank']
     total = rank_data['total_sparks']
     needed, next_total = get_sparks_for_next_rank(rank_id, total)
-    old_menu = user_last_menu.get(message.from_user.id)
+    old_menu = user_last_menu.get(user_id)
     if old_menu:
-        await delete_message_safe(bot, message.chat.id, old_menu)
-        user_last_menu[message.from_user.id] = None
+        await delete_message_safe(bot, chat_id, old_menu)
+        user_last_menu[user_id] = None
     text = f"""{name}, твой прогресс:
 
 {get_rank_emoji(rank_id)} <b>{get_rank_name(rank_id)}</b>
@@ -7990,9 +7864,16 @@ async def handle_rank(message: Message, bot: Bot, state: FSMContext):
 📊 Осталось до следующего ранга: {needed}
 
 <i>{get_rank_motivation(rank_id)}</i>"""
-    await delete_temp_messages(bot, message.from_user.id, message.chat.id, keep_ai=True)
-    msg = await message.answer(text, parse_mode="HTML", reply_markup=rank_back_keyboard())
-    user_temp_messages.setdefault(message.from_user.id, {})['rank'] = msg.message_id
+    await delete_temp_messages(bot, user_id, chat_id, keep_ai=True)
+    msg = await bot.send_message(chat_id, text, parse_mode="HTML")
+    user_temp_messages.setdefault(user_id, {})['rank'] = msg.message_id
+    nav_push(user_id, "rank")
+
+@router.callback_query(F.data == "menu_rank")
+async def handle_rank(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await callback.message.delete()
+    await _show_rank(callback.from_user.id, callback.message.chat.id, bot, state)
+    await callback.answer()
     
     
 def generate_proactive_ai_message(user_id: int) -> str:
@@ -8067,6 +7948,240 @@ def generate_weekly_report(user_id: int) -> str:
 └─────────────────────"""
     return report
     
+# ============ РЕГИСТРАЦИЯ ЭКРАНОВ ДЛЯ УНИВЕРСАЛЬНОЙ КНОПКИ «НАЗАД» ============
+# Каждый экран, на который можно вернуться кнопкой «🔙 Назад», должен уметь
+# перерисоваться сам — эти функции именно это и делают.
+async def _screen_send(bot, user_id, chat_id, text, keyboard, temps_key):
+    temps = user_temp_messages.get(user_id, {})
+    await delete_message_safe(bot, chat_id, temps.get(temps_key))
+    msg = await bot.send_message(chat_id, text, reply_markup=keyboard)
+    temps[temps_key] = msg.message_id
+    user_temp_messages[user_id] = temps
+
+async def _screen_main(bot, user_id, chat_id, state):
+    await send_main_menu(bot, user_id, chat_id)
+
+async def _screen_reflection(bot, user_id, chat_id, state):
+    await show_reflection_menu(user_id, chat_id, bot, state)
+
+async def _screen_workout(bot, user_id, chat_id, state):
+    await show_workout_main_menu(user_id, chat_id, bot)
+
+async def _screen_workout_today(bot, user_id, chat_id, state):
+    await show_ai_workout_today(user_id, chat_id, bot, state)
+
+async def _screen_workout_manage(bot, user_id, chat_id, state):
+    await _show_workout_manage_menu(user_id, chat_id, bot, state)
+
+async def _screen_categories(bot, user_id, chat_id, state):
+    await _do_workout_manage(user_id, chat_id, bot)
+
+async def _screen_diet(bot, user_id, chat_id, state):
+    if get_diet_profile(user_id):
+        await show_diet_menu(user_id, chat_id, bot)
+    else:
+        await send_main_menu(bot, user_id, chat_id)
+
+async def _screen_diet_meal(bot, user_id, chat_id, state):
+    await _diet_log_food_start(user_id, chat_id, bot, state)
+
+async def _screen_tasks(bot, user_id, chat_id, state):
+    await show_tasks_menu(user_id, chat_id, bot)
+
+async def _screen_stats(bot, user_id, chat_id, state):
+    await _show_stats_choice(user_id, chat_id, bot, state)
+
+async def _screen_rank(bot, user_id, chat_id, state):
+    await _show_rank(user_id, chat_id, bot, state)
+
+async def _screen_ai(bot, user_id, chat_id, state):
+    await state.set_state(AIAdvisorState.waiting_for_question)
+    await _screen_send(bot, user_id, chat_id, "🤖 CheckAI тут, чем помочь?", ai_reply_keyboard(), 'ai_advisor')
+    nav_push(user_id, "ai")
+
+async def _screen_history(bot, user_id, chat_id, state):
+    user_history_page[user_id] = 0
+    await show_history_page(user_id, chat_id, bot, state)
+
+async def _screen_workout_history(bot, user_id, chat_id, state):
+    await show_workout_history_page(user_id, chat_id, bot, 0)
+
+async def _screen_food_history(bot, user_id, chat_id, state):
+    user_food_history_page[user_id] = 0
+    await show_food_history_page(user_id, chat_id, bot, state)
+
+# --- Шаги мастера создания плана ---
+async def _screen_wp_mode(bot, user_id, chat_id, state):
+    await state.set_state(AIPlanState.choosing_mode)
+    name = get_user_name(user_id)
+    await _screen_send(bot, user_id, chat_id,
+                       f"{name}, давай настроим тренировки!\n\nСоздать план с ИИ или введёшь свой?",
+                       wp_mode_keyboard(), 'workout_menu')
+    nav_push(user_id, "wp_mode")
+
+async def _screen_wp_goal(bot, user_id, chat_id, state):
+    await state.set_state(AIPlanState.choosing_goal)
+    await _screen_send(bot, user_id, chat_id,
+                       "Создание плана тренировок\n\nШаг 1 из 3\nКакая твоя цель?",
+                       wp_goal_keyboard(), 'workout_menu')
+    nav_push(user_id, "wp_goal")
+
+async def _screen_wp_level(bot, user_id, chat_id, state):
+    await state.set_state(AIPlanState.choosing_level)
+    await _screen_send(bot, user_id, chat_id,
+                       "Создание плана тренировок\n\nШаг 2 из 3\nТвой уровень подготовки?",
+                       wp_level_keyboard(), 'workout_menu')
+    nav_push(user_id, "wp_level")
+
+async def _screen_wp_days(bot, user_id, chat_id, state):
+    await state.set_state(AIPlanState.choosing_days_count)
+    await _screen_send(bot, user_id, chat_id,
+                       "Создание плана тренировок\n\nШаг 3 из 3\nСколько тренировок в неделю готов делать?",
+                       wp_days_keyboard(), 'workout_menu')
+    nav_push(user_id, "wp_days")
+
+async def _screen_wp_notes(bot, user_id, chat_id, state):
+    await state.set_state(AIPlanState.entering_extra_notes)
+    await _screen_send(bot, user_id, chat_id,
+                       "Есть пожелания или особенности?\n\n"
+                       "Например: «травма колена», «нет штанги», «только утром»\nИли нажми Пропустить:",
+                       InlineKeyboardMarkup(inline_keyboard=[
+                           [InlineKeyboardButton(text="Пропустить →", callback_data="wp_notes_skip")]
+                       ]), 'workout_menu')
+    nav_push(user_id, "wp_notes")
+
+async def _screen_wp_review(bot, user_id, chat_id, state):
+    data = await state.get_data()
+    plan = data.get("wp_plan")
+    if not plan:
+        plan_data = get_ai_plan(user_id)
+        plan = plan_data["plan"] if plan_data else None
+    if not plan:
+        await _screen_workout_today(bot, user_id, chat_id, state)
+        return
+    await state.set_state(AIPlanState.reviewing_plan)
+    text = _format_full_plan(plan, data.get("wp_goal", ""), data.get("wp_level", ""), data.get("wp_days", 3))
+    keyboard = (wp_plan_review_keyboard_manual() if data.get("wp_mode") == "manual"
+                else wp_plan_review_keyboard())
+    await _screen_send(bot, user_id, chat_id, text, keyboard, 'workout_menu')
+    nav_push(user_id, "wp_review")
+
+async def _screen_wp_edit(bot, user_id, chat_id, state):
+    await state.set_state(AIPlanState.editing_plan)
+    await _screen_send(bot, user_id, chat_id,
+                       "Что изменить в плане?\n\nНапример:\n«убери приседания, замени на жим ногами»\n«добавь кардио в пятницу»",
+                       None, 'workout_menu')
+    nav_push(user_id, "wp_edit")
+
+async def _screen_wp_manual(bot, user_id, chat_id, state):
+    await state.set_state(AIPlanState.entering_manual_plan)
+    await _screen_send(bot, user_id, chat_id,
+                       "Отправь план одним сообщением в формате:\nДень недели:\nНазвание упражнения - СетыxПовторения(Вес)\n\n"
+                       "Пример: Жим лёжа - 3x5(110кг)", None, 'workout_menu')
+    nav_push(user_id, "wp_manual")
+
+# --- Шаги замены упражнения в плане ---
+WEX_DAY_NAMES = {"monday": "Пн", "tuesday": "Вт", "wednesday": "Ср", "thursday": "Чт",
+                 "friday": "Пт", "saturday": "Сб", "sunday": "Вс"}
+WEX_DAY_ORDER = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+def _wex_day_buttons(user_id):
+    plan_data = get_ai_plan(user_id)
+    if not plan_data:
+        return None
+    plan = plan_data.get("plan", {})
+    cycle = plan_data.get("cycle_weeks", 1)
+    buttons, seen_days = [], set()
+    for w in range(1, cycle + 1):
+        week = plan.get(f"week_{w}", {})
+        for day_key in WEX_DAY_ORDER:
+            if day_key in week and day_key not in seen_days:
+                seen_days.add(day_key)
+                buttons.append([InlineKeyboardButton(text=WEX_DAY_NAMES[day_key],
+                                                     callback_data=f"wex_day_{day_key}")])
+    return buttons
+
+async def _screen_wex_days(bot, user_id, chat_id, state):
+    buttons = _wex_day_buttons(user_id)
+    if buttons is None:
+        await _screen_workout_today(bot, user_id, chat_id, state)
+        return
+    await state.set_state(AIPlanState.editing_plan)
+    await state.update_data(wp_edit_mode="exercise")
+    await _screen_send(bot, user_id, chat_id, "Выбери день тренировки:",
+                       InlineKeyboardMarkup(inline_keyboard=buttons), 'workout_menu')
+    nav_push(user_id, "wex_days")
+
+async def _screen_wex_ex(bot, user_id, chat_id, state):
+    data = await state.get_data()
+    day_key = data.get("wp_edit_day")
+    if not day_key:
+        await _screen_wex_days(bot, user_id, chat_id, state)
+        return
+    plan_data = get_ai_plan(user_id)
+    if not plan_data:
+        await _screen_wex_days(bot, user_id, chat_id, state)
+        return
+    exercises = _wex_day_exercises(plan_data, day_key)
+    if not exercises:
+        await _screen_wex_days(bot, user_id, chat_id, state)
+        return
+    buttons = [[InlineKeyboardButton(text=ex.get("exercise", ex.get("name", f"Упражнение {i+1}")),
+                                     callback_data=f"wex_ex_{i}")] for i, ex in enumerate(exercises)]
+    await _screen_send(bot, user_id, chat_id, "Выбери упражнение для замены:",
+                       InlineKeyboardMarkup(inline_keyboard=buttons), 'workout_menu')
+    nav_push(user_id, "wex_ex")
+
+def _wex_day_exercises(plan_data, day_key):
+    plan = plan_data.get("plan", {})
+    cycle = plan_data.get("cycle_weeks", 1)
+    for w in range(1, cycle + 1):
+        exs = plan.get(f"week_{w}", {}).get(day_key, [])
+        if exs:
+            return exs
+    return []
+
+async def _screen_wex_replace(bot, user_id, chat_id, state):
+    data = await state.get_data()
+    ex_name = data.get("wp_edit_ex_name")
+    if not ex_name:
+        await _screen_wex_ex(bot, user_id, chat_id, state)
+        return
+    await _screen_send(bot, user_id, chat_id,
+                       f"Чем заменить «{ex_name}»?\n\nНапиши название нового упражнения:",
+                       None, 'workout_menu')
+    nav_push(user_id, "wex_replace")
+
+SCREEN_RENDER.update({
+    "main": _screen_main,
+    "reflection": _screen_reflection,
+    "workout": _screen_workout,
+    "workout_today": _screen_workout_today,
+    "workout_manage": _screen_workout_manage,
+    "categories": _screen_categories,
+    "diet": _screen_diet,
+    "diet_meal": _screen_diet_meal,
+    "tasks": _screen_tasks,
+    "stats": _screen_stats,
+    "rank": _screen_rank,
+    "ai": _screen_ai,
+    "history": _screen_history,
+    "workout_history": _screen_workout_history,
+    "food_history": _screen_food_history,
+    "wp_mode": _screen_wp_mode,
+    "wp_goal": _screen_wp_goal,
+    "wp_level": _screen_wp_level,
+    "wp_days": _screen_wp_days,
+    "wp_notes": _screen_wp_notes,
+    "wp_review": _screen_wp_review,
+    "wp_edit": _screen_wp_edit,
+    "wp_manual": _screen_wp_manual,
+    "wp_review_decline_prompt": _screen_workout_today,
+    "wex_days": _screen_wex_days,
+    "wex_ex": _screen_wex_ex,
+    "wex_replace": _screen_wex_replace,
+})
+
 async def main():
     global scheduler
     print("[BOOT] Старт...")
