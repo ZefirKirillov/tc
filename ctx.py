@@ -130,24 +130,18 @@ scheduler = None
 bot_instance = None
 
 # ============ УНИВЕРСАЛЬНАЯ КНОПКА «НАЗАД» ============
-# Telegram разрешает прикрепить к сообщению либо inline-, либо reply-клавиатуру
-# (но не обе сразу). Поэтому навигационная «🔙 Назад» живёт на отдельной
-# постоянной reply-клавиатуре, а все остальные кнопки — inline.
 BACK_BUTTON_TEXT = "🔙 Назад"
 user_back_kb: Dict[int, int] = {}        # id сообщения-носителя reply-клавиатуры
 user_nav: Dict[int, List[str]] = {}      # стек экранов для кнопки «Назад»
 SCREEN_RENDER: Dict[str, Any] = {}       # имя экрана -> async fn(bot, user_id, chat_id, state)
 
 def back_reply_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BACK_BUTTON_TEXT)]],
-        resize_keyboard=True,
-        one_time_keyboard=False
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=BACK_BUTTON_TEXT, callback_data="nav_back")]]
     )
 
 async def ensure_back_keyboard(bot: Bot, chat_id: int, user_id: int):
-    """Reply-клавиатуру нельзя повесить на сообщение с inline-кнопками,
-    поэтому отправляем её одним отдельным сообщением и никогда не удаляем."""
+    """Отправляет сообщение с inline-кнопкой «Назад» если пользователь ещё не получал его."""
     if user_id in user_back_kb:
         return
     try:
@@ -157,7 +151,7 @@ async def ensure_back_keyboard(bot: Bot, chat_id: int, user_id: int):
         )
         user_back_kb[user_id] = msg.message_id
     except Exception as e:
-        print(f"[NAV] Не удалось отправить reply-клавиатуру: {e}")
+        print(f"[NAV] Не удалось отправить inline-клавиатуру: {e}")
 
 class BackKeyboardMiddleware(BaseMiddleware):
     """До этого ensure_back_keyboard() вызывался только из send_main_menu,
@@ -810,6 +804,18 @@ async def universal_back(message: Message, bot: Bot, state: FSMContext):
                       "diet_meal", "ai"}:
         await state.clear()
     await render_screen(bot, user_id, message.chat.id, state, screen)
+
+@router.callback_query(F.data == "nav_back")
+async def universal_back_inline(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    """Универсальная навигационная inline-кнопка: возвращает на один экран назад."""
+    user_id = callback.from_user.id
+    screen = nav_pop(user_id)
+    if screen not in {"wp_mode", "wp_goal", "wp_level", "wp_days", "wp_notes", "wp_review",
+                      "wp_edit", "wp_manual", "wex_days", "wex_ex", "wex_replace",
+                      "diet_meal", "ai"}:
+        await state.clear()
+    await render_screen(bot, user_id, callback.message.chat.id, state, screen)
+    await callback.answer()
 
 @router.message(StateFilter("waiting_for_photo"), F.text)
 async def photo_timeout(message: Message, bot: Bot, state: FSMContext):
